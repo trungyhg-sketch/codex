@@ -1601,7 +1601,10 @@ impl TestAppServer {
     }
 
     async fn send_jsonrpc_message(&mut self, message: JSONRPCMessage) -> anyhow::Result<()> {
-        eprintln!("writing message to stdin: {message:?}");
+        eprintln!(
+            "{}",
+            jsonrpc_console_diagnostic("writing message to stdin", &message)
+        );
         let Some(stdin) = self.stdin.as_mut() else {
             anyhow::bail!("mcp stdin closed");
         };
@@ -1616,7 +1619,10 @@ impl TestAppServer {
         let mut line = String::new();
         self.stdout.read_line(&mut line).await?;
         let message = serde_json::from_str::<JSONRPCMessage>(&line)?;
-        eprintln!("read message from stdout: {message:?}");
+        eprintln!(
+            "{}",
+            jsonrpc_console_diagnostic("read message from stdout", &message)
+        );
         Ok(message)
     }
 
@@ -1823,6 +1829,28 @@ impl TestAppServer {
             JSONRPCMessage::Error(err) => Some(&err.id),
             JSONRPCMessage::Notification(_) => None,
         }
+    }
+}
+
+fn jsonrpc_console_diagnostic(direction: &str, message: &JSONRPCMessage) -> String {
+    const OWNERSHIP_EVIDENCE_METHOD: &str = "item/commandExecution/ownershipEvidence";
+    const TERMINATE_OWNED_METHOD: &str = "item/commandExecution/terminateOwned";
+
+    let is_sensitive_method =
+        |method: &str| matches!(method, OWNERSHIP_EVIDENCE_METHOD | TERMINATE_OWNED_METHOD);
+
+    match message {
+        JSONRPCMessage::Request(request) if is_sensitive_method(&request.method) => format!(
+            "{direction}: JSON-RPC request method={} id={:?} params=[REDACTED]",
+            request.method, request.id
+        ),
+        JSONRPCMessage::Notification(notification) if is_sensitive_method(&notification.method) => {
+            format!(
+                "{direction}: JSON-RPC notification method={} params=[REDACTED]",
+                notification.method
+            )
+        }
+        _ => format!("{direction}: {message:?}"),
     }
 }
 

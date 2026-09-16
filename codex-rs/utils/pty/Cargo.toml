@@ -11,6 +11,7 @@ workspace = true
 anyhow = { workspace = true }
 portable-pty = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
@@ -27,6 +28,7 @@ winapi = { version = "0.3.9", features = [
     "libloaderapi",
     "minwinbase",
     "processthreadsapi",
+    "tlhelp32",
     "synchapi",
     "winbase",
     "wincon",

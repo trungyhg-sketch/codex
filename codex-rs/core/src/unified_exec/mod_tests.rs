@@ -134,8 +134,18 @@ async fn exec_command_with_tty(
     if process_started_alive {
         let entry = ProcessEntry {
             process: Arc::clone(&process),
+            ownership: ProcessOwnershipEvidence {
+                native_process_ownership: process.native_process_ownership().cloned(),
+                command_signature: None,
+                identity_state: super::process_manager::native_identity_state(
+                    process.native_process_ownership(),
+                ),
+                spawned_at: started_at,
+            },
+            ownership_termination: OwnershipTerminationState::Active,
             plugin_metrics_sidecar: None,
             call_id: context.call_id.clone(),
+            turn_id: context.step_context.turn.sub_id.clone(),
             process_id,
             cwd: cwd.clone().into(),
             initial_exec_command_active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -297,6 +307,7 @@ async fn blocking_terminate_unified_process(
                 wake_tx,
             }),
             sandbox_type: Some(codex_sandboxing::SandboxType::None),
+            native_process_ownership: None,
         })
         .await?,
     ))
@@ -562,6 +573,47 @@ async fn reusing_completed_process_returns_unknown_process() -> anyhow::Result<(
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owned_termination_revalidates_and_terminates_local_process() -> anyhow::Result<()> {
+    skip_if_sandbox!(Ok(()));
+
+    let (session, turn) = test_session_and_turn().await;
+    let output = exec_command(
+        &session, &turn, "sleep 60", /*yield_time_ms*/ 250, /*workdir*/ None,
+    )
+    .await?;
+    let process_id = output.process_id.expect("expected live process id");
+    let manager = &session.services.unified_exec_manager;
+    let params = {
+        let store = manager.process_store.lock().await;
+        let ownership = store.processes[&process_id]
+            .ownership
+            .native_process_ownership
+            .as_ref()
+            .expect("local process should have ownership evidence");
+        codex_exec_server_protocol::TerminateOwnedParams {
+            process_id: process_id.to_string().into(),
+            ownership_token: ownership.ownership_token.clone(),
+            expected_identity: ownership
+                .identity
+                .clone()
+                .expect("local process should have native identity"),
+        }
+    };
+
+    assert_eq!(
+        manager.terminate_owned_process(params).await,
+        codex_exec_server_protocol::TerminateOwnedOutcome::Terminated
+    );
+    assert!(
+        manager.process_store.lock().await.processes[&process_id]
+            .process
+            .has_exited()
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminating_initial_exec_command_rechecks_initial_response_state() -> anyhow::Result<()> {
     let (session, turn) = test_session_and_turn().await;
@@ -581,8 +633,16 @@ async fn terminating_initial_exec_command_rechecks_initial_response_state() -> a
         process_id,
         ProcessEntry {
             process,
+            ownership: ProcessOwnershipEvidence {
+                native_process_ownership: None,
+                command_signature: None,
+                identity_state: NativeIdentityState::Unavailable,
+                spawned_at: Instant::now(),
+            },
+            ownership_termination: OwnershipTerminationState::Active,
             plugin_metrics_sidecar: None,
             call_id: "call".to_string(),
+            turn_id: "turn".to_string(),
             process_id,
             cwd: cwd.into(),
             initial_exec_command_active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -655,8 +715,16 @@ async fn terminating_during_stdin_poll_returns_exited_response() -> anyhow::Resu
         process_id,
         ProcessEntry {
             process: Arc::clone(&process),
+            ownership: ProcessOwnershipEvidence {
+                native_process_ownership: None,
+                command_signature: None,
+                identity_state: NativeIdentityState::Unavailable,
+                spawned_at: last_used,
+            },
+            ownership_termination: OwnershipTerminationState::Active,
             plugin_metrics_sidecar: None,
             call_id: "call".to_string(),
+            turn_id: "turn".to_string(),
             process_id,
             cwd: cwd.into(),
             initial_exec_command_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),

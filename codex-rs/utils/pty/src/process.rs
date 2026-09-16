@@ -109,6 +109,10 @@ type ResizeFn = Box<dyn FnMut(TerminalSize) -> anyhow::Result<()> + Send>;
 
 /// Handle for driving an interactive process (PTY or pipe).
 pub struct ProcessHandle {
+    native_process_identity: Option<crate::NativeProcessIdentity>,
+    #[cfg(windows)]
+    native_process_handle: Option<std::os::windows::io::OwnedHandle>,
+    process_ownership_token: Option<crate::ProcessOwnershipToken>,
     writer_tx: StdMutex<Option<mpsc::Sender<Vec<u8>>>>,
     killer: StdMutex<Option<Box<dyn ChildTerminator>>>,
     reader_handle: StdMutex<Option<JoinHandle<()>>>,
@@ -134,6 +138,9 @@ impl fmt::Debug for ProcessHandle {
 impl ProcessHandle {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
+        native_process_identity: Option<crate::NativeProcessIdentity>,
+        #[cfg(windows)] native_process_handle: Option<std::os::windows::io::OwnedHandle>,
+        process_ownership_token: Option<crate::ProcessOwnershipToken>,
         writer_tx: mpsc::Sender<Vec<u8>>,
         killer: Box<dyn ChildTerminator>,
         reader_handle: JoinHandle<()>,
@@ -146,6 +153,10 @@ impl ProcessHandle {
         resizer: Option<ResizeFn>,
     ) -> Self {
         Self {
+            native_process_identity,
+            #[cfg(windows)]
+            native_process_handle,
+            process_ownership_token,
             writer_tx: StdMutex::new(Some(writer_tx)),
             killer: StdMutex::new(Some(killer)),
             reader_handle: StdMutex::new(Some(reader_handle)),
@@ -156,6 +167,62 @@ impl ProcessHandle {
             exit_code,
             _pty_handles: StdMutex::new(pty_handles),
             resizer: StdMutex::new(resizer),
+        }
+    }
+
+    /// Returns the immutable native identity captured at spawn time.
+    pub fn native_process_identity(&self) -> Option<&crate::NativeProcessIdentity> {
+        self.native_process_identity.as_ref()
+    }
+
+    /// Returns opaque ownership evidence generated for this native process.
+    pub fn process_ownership_token(&self) -> Option<&crate::ProcessOwnershipToken> {
+        self.process_ownership_token.as_ref()
+    }
+
+    /// Revalidates spawn-time identity against the currently owned native process.
+    pub fn revalidate_native_process_identity(
+        &self,
+        expected: &crate::NativeProcessIdentity,
+    ) -> crate::NativeProcessIdentityValidationResult {
+        use crate::NativeProcessIdentityValidationResult::*;
+        let Some(stored) = self.native_process_identity.as_ref() else {
+            return Unsupported;
+        };
+        let stored_match =
+            crate::native_process_identity::compare_native_process_identity(expected, stored);
+        if stored_match != Match {
+            return stored_match;
+        }
+        if self.has_exited() {
+            return ProcessExited;
+        }
+
+        #[cfg(target_os = "linux")]
+        let current = crate::native_process_identity::capture_linux_process_identity(stored.os_pid);
+        #[cfg(windows)]
+        let current = self
+            .native_process_handle
+            .as_ref()
+            .map(|handle| {
+                use std::os::windows::io::AsRawHandle;
+                crate::native_process_identity::capture_native_process_identity(
+                    stored.os_pid,
+                    handle.as_raw_handle(),
+                )
+            })
+            .ok_or_else(|| std::io::Error::other("owned process handle unavailable"));
+        #[cfg(all(not(target_os = "linux"), not(windows)))]
+        return Unsupported;
+
+        match current {
+            Ok(current) => {
+                crate::native_process_identity::compare_native_process_identity(expected, &current)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => ProcessExited,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => IdentityUnavailable,
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidData => IdentityUnavailable,
+            Err(_) => InternalError,
         }
     }
 
@@ -453,6 +520,11 @@ pub fn spawn_from_driver(driver: ProcessDriver) -> SpawnedProcess {
     });
 
     let handle = ProcessHandle::new(
+        /*native_process_identity*/ None,
+        #[cfg(windows)]
+        /*native_process_handle*/
+        None,
+        /*process_ownership_token*/ None,
         writer_tx,
         Box::new(ClosureTerminator {
             inner: terminator,

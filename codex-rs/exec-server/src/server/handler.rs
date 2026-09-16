@@ -58,6 +58,8 @@ use crate::protocol::ReadParams;
 use crate::protocol::ReadResponse;
 use crate::protocol::SignalParams;
 use crate::protocol::SignalResponse;
+use crate::protocol::TerminateOwnedParams;
+use crate::protocol::TerminateOwnedResponse;
 use crate::protocol::TerminateParams;
 use crate::protocol::TerminateResponse;
 use crate::protocol::WriteParams;
@@ -231,6 +233,14 @@ impl ExecServerHandler {
     ) -> Result<TerminateResponse, JSONRPCErrorError> {
         let session = self.require_initialized_for("exec")?;
         session.process().terminate(params).await
+    }
+
+    pub(crate) async fn terminate_owned(
+        &self,
+        params: TerminateOwnedParams,
+    ) -> Result<TerminateOwnedResponse, JSONRPCErrorError> {
+        let session = self.require_initialized_for("exec")?;
+        session.process().terminate_owned(params).await
     }
 
     pub(crate) async fn http_request(

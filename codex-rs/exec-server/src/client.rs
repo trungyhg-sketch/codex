@@ -56,6 +56,7 @@ use crate::protocol::EXEC_OUTPUT_DELTA_METHOD;
 use crate::protocol::EXEC_READ_METHOD;
 use crate::protocol::EXEC_SIGNAL_METHOD;
 use crate::protocol::EXEC_TERMINATE_METHOD;
+use crate::protocol::EXEC_TERMINATE_OWNED_METHOD;
 use crate::protocol::EXEC_WRITE_METHOD;
 use crate::protocol::EnvironmentConfigReadParams;
 use crate::protocol::EnvironmentConfigReadResponse;
@@ -116,6 +117,8 @@ use crate::protocol::ReadParams;
 use crate::protocol::ReadResponse;
 use crate::protocol::SignalParams;
 use crate::protocol::SignalResponse;
+use crate::protocol::TerminateOwnedParams;
+use crate::protocol::TerminateOwnedResponse;
 use crate::protocol::TerminateParams;
 use crate::protocol::TerminateResponse;
 use crate::protocol::WriteParams;
@@ -237,6 +240,7 @@ pub(crate) struct Session {
     client: ExecServerClient,
     process_id: ProcessId,
     sandbox_type: Option<ProcessSandboxType>,
+    native_process_ownership: Option<crate::protocol::NativeProcessOwnership>,
     state: Arc<SessionState>,
 }
 
@@ -1003,6 +1007,7 @@ impl ExecServerClient {
                             client: client.clone(),
                             process_id: process_id.clone(),
                             sandbox_type: response.sandbox_type,
+                            native_process_ownership: response.native_process_ownership,
                             state: Arc::clone(&state),
                         };
                         // Wait for caller receipt so cancellation after send still triggers cleanup.
@@ -1053,6 +1058,7 @@ impl ExecServerClient {
             client: self.clone(),
             process_id: process_id.clone(),
             sandbox_type: None,
+            native_process_ownership: None,
             state,
         })
     }
@@ -1410,6 +1416,21 @@ impl Session {
         self.sandbox_type
     }
 
+    pub async fn terminate_owned(
+        &self,
+        params: &TerminateOwnedParams,
+    ) -> Result<TerminateOwnedResponse, ExecServerError> {
+        self.client
+            .call_for_cleanup(EXEC_TERMINATE_OWNED_METHOD, params)
+            .await
+    }
+
+    pub(crate) fn native_process_ownership(
+        &self,
+    ) -> Option<&crate::protocol::NativeProcessOwnership> {
+        self.native_process_ownership.as_ref()
+    }
+
     pub(crate) fn subscribe_wake(&self) -> watch::Receiver<u64> {
         self.state.subscribe()
     }
@@ -1739,6 +1760,7 @@ mod tests {
     use crate::protocol::EXEC_METHOD;
     use crate::protocol::EXEC_OUTPUT_DELTA_METHOD;
     use crate::protocol::EXEC_READ_METHOD;
+    use crate::protocol::EXEC_TERMINATE_OWNED_METHOD;
     use crate::protocol::EXEC_WRITE_METHOD;
     use crate::protocol::ExecClosedNotification;
     use crate::protocol::ExecExitedNotification;
@@ -1749,9 +1771,14 @@ mod tests {
     use crate::protocol::INITIALIZE_METHOD;
     use crate::protocol::INITIALIZED_METHOD;
     use crate::protocol::InitializeResponse;
+    use crate::protocol::NativeProcessIdentity;
     use crate::protocol::ProcessOutputChunk;
+    use crate::protocol::ProcessOwnershipToken;
     use crate::protocol::ProcessSandboxType;
     use crate::protocol::ReadResponse;
+    use crate::protocol::TerminateOwnedOutcome;
+    use crate::protocol::TerminateOwnedParams;
+    use crate::protocol::TerminateOwnedResponse;
     use crate::protocol::WriteParams;
     use crate::protocol::WriteResponse;
     use crate::protocol::WriteStatus;
@@ -1777,6 +1804,94 @@ mod tests {
             .write_all(format!("{encoded}\n").as_bytes())
             .await
             .expect("json-rpc line should write");
+    }
+
+    #[tokio::test]
+    async fn session_terminate_owned_uses_ownership_rpc_without_legacy_fallback() {
+        let (client_stdin, server_reader) = duplex(1 << 20);
+        let (mut server_writer, client_stdout) = duplex(1 << 20);
+        let expected = TerminateOwnedParams {
+            process_id: ProcessId::from("owned-remote-process"),
+            ownership_token: ProcessOwnershipToken::from_opaque(
+                "opaque-route-test-token".to_string(),
+            ),
+            expected_identity: NativeProcessIdentity {
+                os_pid: 42,
+                creation_time: Some(100),
+                executable_identity: Some("/usr/bin/safe-tool".to_string()),
+                parent_pid: Some(7),
+                parent_creation_time: Some(50),
+                platform: "linux".to_string(),
+            },
+        };
+        let server_expected = expected.clone();
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_reader).lines();
+            let initialize = match read_jsonrpc_line(&mut lines).await {
+                JSONRPCMessage::Request(request) if request.method == INITIALIZE_METHOD => request,
+                other => panic!("expected initialize request, got {other:?}"),
+            };
+            write_jsonrpc_line(
+                &mut server_writer,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: initialize.id,
+                    result: serde_json::to_value(InitializeResponse {
+                        session_id: "owned-route-test".to_string(),
+                    })
+                    .unwrap(),
+                }),
+            )
+            .await;
+            match read_jsonrpc_line(&mut lines).await {
+                JSONRPCMessage::Notification(notification)
+                    if notification.method == INITIALIZED_METHOD => {}
+                other => panic!("expected initialized notification, got {other:?}"),
+            }
+            let request = match read_jsonrpc_line(&mut lines).await {
+                JSONRPCMessage::Request(request)
+                    if request.method == EXEC_TERMINATE_OWNED_METHOD =>
+                {
+                    request
+                }
+                other => panic!("expected ownership-aware termination request, got {other:?}"),
+            };
+            let params: TerminateOwnedParams =
+                serde_json::from_value(request.params.expect("terminate params")).unwrap();
+            assert_eq!(params, server_expected);
+            write_jsonrpc_line(
+                &mut server_writer,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::to_value(TerminateOwnedResponse {
+                        outcome: TerminateOwnedOutcome::Terminated,
+                    })
+                    .unwrap(),
+                }),
+            )
+            .await;
+        });
+
+        let client = ExecServerClient::connect(
+            JsonRpcConnection::from_stdio(
+                client_stdout,
+                client_stdin,
+                "owned-route-test-client".to_string(),
+            ),
+            ExecServerClientConnectOptions::default(),
+        )
+        .await
+        .unwrap();
+        let session = super::Session {
+            client,
+            process_id: expected.process_id.clone(),
+            sandbox_type: None,
+            native_process_ownership: None,
+            state: Arc::new(super::SessionState::new(/*recoverable*/ false)),
+        };
+
+        let response = session.terminate_owned(&expected).await.unwrap();
+        assert_eq!(response.outcome, TerminateOwnedOutcome::Terminated);
+        server.await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -1823,6 +1938,7 @@ mod tests {
                     result: serde_json::to_value(ExecResponse {
                         process_id: params.process_id,
                         sandbox_type: Some(ProcessSandboxType::LinuxSeccomp),
+                        native_process_ownership: None,
                     })
                     .expect("process start response should serialize"),
                 }),

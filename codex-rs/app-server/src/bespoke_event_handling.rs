@@ -16,6 +16,7 @@ use codex_app_server_protocol::AdditionalPermissionProfile as V2AdditionalPermis
 use codex_app_server_protocol::CodexErrorInfo as V2CodexErrorInfo;
 use codex_app_server_protocol::CommandAction as V2ParsedCommand;
 use codex_app_server_protocol::CommandExecutionApprovalDecision;
+use codex_app_server_protocol::CommandExecutionOwnershipEvidenceNotification;
 use codex_app_server_protocol::CommandExecutionPresentation;
 use codex_app_server_protocol::CommandExecutionRequestApprovalParams;
 use codex_app_server_protocol::CommandExecutionRequestApprovalResponse;
@@ -1017,6 +1018,32 @@ pub(crate) async fn apply_bespoke_event_handling(
                 }),
                 _ => None,
             };
+            let ownership_notification = match &event.item {
+                CoreTurnItem::CommandExecution(item) => {
+                    if let Some(process_id) = item.process_id.as_deref() {
+                        conversation
+                            .command_execution_ownership_evidence(
+                                process_id,
+                                &event.turn_id,
+                                &item.id,
+                            )
+                            .await
+                            .map(|termination| {
+                                ServerNotification::CommandExecutionOwnershipEvidence(
+                                    CommandExecutionOwnershipEvidenceNotification {
+                                        thread_id: conversation_id.to_string(),
+                                        turn_id: event.turn_id.clone(),
+                                        item_id: item.id.clone(),
+                                        termination,
+                                    },
+                                )
+                            })
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
             if should_emit {
                 let notification = item_event_to_server_notification(
                     EventMsg::ItemStarted(event),
@@ -1024,6 +1051,9 @@ pub(crate) async fn apply_bespoke_event_handling(
                     &event_turn_id,
                 );
                 outgoing.send_server_notification(notification).await;
+                if let Some(notification) = ownership_notification {
+                    outgoing.send_server_notification(notification).await;
+                }
             }
             if let Some(params) = dynamic_tool_call_params {
                 let call_id = params.call_id.clone();

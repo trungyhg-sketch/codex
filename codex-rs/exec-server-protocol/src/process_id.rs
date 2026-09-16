@@ -2,11 +2,16 @@ use std::borrow::Borrow;
 use std::fmt;
 use std::ops::Deref;
 
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
+use ts_rs::TS;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema, TS,
+)]
 #[serde(transparent)]
+#[ts(export_to = "v2/")]
 pub struct ProcessId(String);
 
 impl ProcessId {

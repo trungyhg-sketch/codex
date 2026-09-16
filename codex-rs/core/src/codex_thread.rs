@@ -243,6 +243,32 @@ impl CodexThread {
         self.io.submit(op).await
     }
 
+    pub async fn command_execution_ownership_evidence(
+        &self,
+        process_id: &str,
+        turn_id: &str,
+        item_id: &str,
+    ) -> Option<codex_exec_server_protocol::TerminateOwnedParams> {
+        self.session
+            .services
+            .unified_exec_manager
+            .owned_termination_params(process_id, turn_id, item_id)
+            .await
+    }
+
+    pub async fn terminate_owned_command_execution(
+        &self,
+        turn_id: &str,
+        item_id: &str,
+        params: codex_exec_server_protocol::TerminateOwnedParams,
+    ) -> codex_exec_server_protocol::TerminateOwnedOutcome {
+        self.session
+            .services
+            .unified_exec_manager
+            .terminate_correlated_owned_process(turn_id, item_id, params)
+            .await
+    }
+
     /// Returns the session telemetry handle for thread-scoped production instrumentation.
     pub fn session_telemetry(&self) -> SessionTelemetry {
         self.session.services.session_telemetry.clone()

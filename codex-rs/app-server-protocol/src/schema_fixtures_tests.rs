@@ -243,3 +243,12 @@ fn read_tree(root: &Path, label: &str) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
         )
     })
 }
+
+#[test]
+#[ignore = "temporary Stage3B experimental schema export"]
+fn stage3b_write_experimental_json_schema() -> Result<()> {
+    let output_dir =
+        PathBuf::from("/mnt/c/Users/ACER/.openclaw/workspace/_stage3b_json_schema_tmp");
+    std::fs::create_dir_all(&output_dir)?;
+    generate_json_with_experimental(&output_dir, /*experimental_api*/ true)
+}

@@ -1,4 +1,6 @@
 use rand::Rng;
+use sha2::Digest;
+use sha2::Sha256;
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -43,8 +45,12 @@ use crate::unified_exec::MAX_UNIFIED_EXEC_PROCESSES;
 use crate::unified_exec::MAX_YIELD_TIME_MS;
 use crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS;
 use crate::unified_exec::MIN_YIELD_TIME_MS;
+use crate::unified_exec::NativeIdentityState;
+use crate::unified_exec::OwnershipTerminationState;
 use crate::unified_exec::ProcessEntry;
+use crate::unified_exec::ProcessOwnershipEvidence;
 use crate::unified_exec::ProcessStore;
+use crate::unified_exec::SafeCommandSignature;
 use crate::unified_exec::UnifiedExecContext;
 use crate::unified_exec::UnifiedExecError;
 use crate::unified_exec::UnifiedExecProcessManager;
@@ -110,6 +116,39 @@ pub(super) fn set_deterministic_process_ids_for_tests(enabled: bool) {
 
 fn deterministic_process_ids_forced_for_tests() -> bool {
     FORCE_DETERMINISTIC_PROCESS_IDS.load(Ordering::Relaxed)
+}
+
+fn safe_command_signature(command: &[String], cwd: &PathUri) -> Option<SafeCommandSignature> {
+    if command.is_empty() {
+        return None;
+    }
+
+    let mut digest = Sha256::new();
+    digest.update(b"codex-native-command-signature-v1\0");
+    for part in command {
+        digest.update(part.len().to_le_bytes());
+        digest.update(part.as_bytes());
+    }
+    let cwd = cwd.to_string();
+    digest.update(cwd.len().to_le_bytes());
+    digest.update(cwd.as_bytes());
+    Some(SafeCommandSignature(digest.finalize().into()))
+}
+
+pub(super) fn native_identity_state(
+    ownership: Option<&codex_exec_server::NativeProcessOwnership>,
+) -> NativeIdentityState {
+    let Some(identity) = ownership.and_then(|ownership| ownership.identity.as_ref()) else {
+        return NativeIdentityState::Unavailable;
+    };
+    if identity.creation_time.is_some()
+        && identity.executable_identity.is_some()
+        && identity.parent_pid.is_some()
+    {
+        NativeIdentityState::Complete
+    } else {
+        NativeIdentityState::Partial
+    }
 }
 
 fn should_use_deterministic_process_ids() -> bool {
@@ -458,7 +497,14 @@ impl UnifiedExecProcessManager {
     pub(crate) async fn release_process_id(&self, process_id: i32) {
         let removed = {
             let mut store = self.process_store.lock().await;
-            store.remove(process_id)
+            match store.processes.get(&process_id) {
+                Some(entry)
+                    if entry.ownership_termination == OwnershipTerminationState::Terminating =>
+                {
+                    None
+                }
+                _ => store.remove(process_id),
+            }
         };
         if let Some(entry) = removed {
             unregister_network_approval_for_entry(&entry).await;
@@ -1015,10 +1061,19 @@ impl UnifiedExecProcessManager {
     ) {
         let plugin_metrics_sidecar =
             metrics_sidecar.map(|sidecar| Arc::new(std::sync::Mutex::new(Some(sidecar))));
+        let native_process_ownership = process.native_process_ownership().cloned();
         let entry = ProcessEntry {
             process: Arc::clone(&process),
+            ownership: ProcessOwnershipEvidence {
+                identity_state: native_identity_state(native_process_ownership.as_ref()),
+                native_process_ownership,
+                command_signature: safe_command_signature(command, &cwd),
+                spawned_at: started_at,
+            },
+            ownership_termination: OwnershipTerminationState::Active,
             plugin_metrics_sidecar: plugin_metrics_sidecar.clone(),
             call_id: context.call_id.clone(),
+            turn_id: context.step_context.turn.sub_id.clone(),
             process_id,
             cwd: cwd.clone(),
             initial_exec_command_active,
@@ -1475,6 +1530,12 @@ impl UnifiedExecProcessManager {
                 .processes
                 .get(&process_id)
                 .map(|entry| Arc::clone(&entry.process));
+            if store.processes.get(&process_id).is_some_and(|entry| {
+                entry.ownership_termination == OwnershipTerminationState::Terminating
+            }) {
+                meta.retain(|(id, _, _)| *id != process_id);
+                continue;
+            }
             let candidate_has_exited = candidate_process
                 .as_ref()
                 .is_some_and(|process| process.has_exited());
@@ -1569,12 +1630,26 @@ impl UnifiedExecProcessManager {
     }
 
     pub(crate) async fn terminate_process(&self, process_id: i32) -> bool {
-        let (process, already_exited) = {
+        let process = {
             let store = self.process_store.lock().await;
             let Some(entry) = store.processes.get(&process_id) else {
                 return false;
             };
-            (Arc::clone(&entry.process), entry.process.has_exited())
+            Arc::clone(&entry.process)
+        };
+        let _interaction_guard = process.interaction_lock().lock_owned().await;
+        let already_exited = {
+            let store = self.process_store.lock().await;
+            let Some(entry) = store.processes.get(&process_id) else {
+                return true;
+            };
+            if !Arc::ptr_eq(&entry.process, &process) {
+                return true;
+            }
+            if entry.ownership_termination != OwnershipTerminationState::Active {
+                return true;
+            }
+            entry.process.has_exited()
         };
 
         if !already_exited && process.terminate_confirmed().await.is_err() {
@@ -1600,6 +1675,124 @@ impl UnifiedExecProcessManager {
 
         unregister_network_approval_for_entry(&entry).await;
         true
+    }
+
+    pub(crate) async fn owned_termination_params(
+        &self,
+        process_id: &str,
+        turn_id: &str,
+        item_id: &str,
+    ) -> Option<codex_exec_server_protocol::TerminateOwnedParams> {
+        let process_id = process_id.parse::<i32>().ok()?;
+        let store = self.process_store.lock().await;
+        let entry = store.processes.get(&process_id)?;
+        if entry.call_id != item_id
+            || entry.turn_id != turn_id
+            || entry.ownership.identity_state != NativeIdentityState::Complete
+        {
+            return None;
+        }
+        let ownership = entry.ownership.native_process_ownership.as_ref()?;
+        Some(codex_exec_server_protocol::TerminateOwnedParams {
+            process_id: process_id.to_string().into(),
+            ownership_token: ownership.ownership_token.clone(),
+            expected_identity: ownership.identity.clone()?,
+        })
+    }
+
+    pub(crate) async fn terminate_correlated_owned_process(
+        &self,
+        turn_id: &str,
+        item_id: &str,
+        params: codex_exec_server_protocol::TerminateOwnedParams,
+    ) -> codex_exec_server_protocol::TerminateOwnedOutcome {
+        use codex_exec_server_protocol::TerminateOwnedOutcome::*;
+
+        let Ok(process_id) = params.process_id.as_str().parse::<i32>() else {
+            return ProcessNotFound;
+        };
+        {
+            let store = self.process_store.lock().await;
+            let Some(entry) = store.processes.get(&process_id) else {
+                return ProcessNotFound;
+            };
+            if entry.call_id != item_id || entry.turn_id != turn_id {
+                return StaleEvidence;
+            }
+        }
+        self.terminate_owned_process(params).await
+    }
+
+    pub(crate) async fn terminate_owned_process(
+        &self,
+        params: codex_exec_server_protocol::TerminateOwnedParams,
+    ) -> codex_exec_server_protocol::TerminateOwnedOutcome {
+        use codex_exec_server_protocol::TerminateOwnedOutcome::*;
+
+        let Ok(process_id) = params.process_id.as_str().parse::<i32>() else {
+            return ProcessNotFound;
+        };
+
+        let process = {
+            let store = self.process_store.lock().await;
+            let Some(entry) = store.processes.get(&process_id) else {
+                return ProcessNotFound;
+            };
+            Arc::clone(&entry.process)
+        };
+
+        // Lock ordering is always interaction_lock -> ProcessStore. ProcessStore
+        // is released before the owned termination await, so remote RPC cannot
+        // block unrelated registry operations or form a lock cycle.
+        let _interaction_guard = process.interaction_lock().lock_owned().await;
+        {
+            let mut store = self.process_store.lock().await;
+            let Some(entry) = store.processes.get_mut(&process_id) else {
+                return ProcessNotFound;
+            };
+            if !Arc::ptr_eq(&entry.process, &process) {
+                return ProcessReplaced;
+            }
+            let Some(ownership) = &entry.ownership.native_process_ownership else {
+                return Unsupported;
+            };
+            if ownership.ownership_token != params.ownership_token {
+                return OwnershipMismatch;
+            }
+            if entry.ownership.identity_state != NativeIdentityState::Complete {
+                return match entry.ownership.identity_state {
+                    NativeIdentityState::Unavailable => IdentityUnavailable,
+                    NativeIdentityState::Partial => PartialIdentity,
+                    NativeIdentityState::Complete => unreachable!(),
+                };
+            }
+            if ownership.identity.as_ref() != Some(&params.expected_identity) {
+                return StaleEvidence;
+            }
+            match entry.ownership_termination {
+                OwnershipTerminationState::Active => {
+                    entry.ownership_termination = OwnershipTerminationState::Terminating;
+                }
+                OwnershipTerminationState::Terminating => return NotTerminable,
+                OwnershipTerminationState::Terminated(outcome) => return outcome,
+            }
+        }
+
+        let outcome = process.terminate_owned(params.clone()).await;
+
+        let mut store = self.process_store.lock().await;
+        if let Some(entry) = store.processes.get_mut(&process_id)
+            && Arc::ptr_eq(&entry.process, &process)
+            && entry
+                .ownership
+                .native_process_ownership
+                .as_ref()
+                .is_some_and(|ownership| ownership.ownership_token == params.ownership_token)
+            && entry.ownership_termination == OwnershipTerminationState::Terminating
+        {
+            entry.ownership_termination = OwnershipTerminationState::Terminated(outcome);
+        }
+        outcome
     }
 }
 

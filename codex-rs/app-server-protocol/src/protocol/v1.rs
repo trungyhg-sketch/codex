@@ -65,6 +65,23 @@ pub struct InitializeCapabilities {
     pub extensions: Option<HashMap<String, serde_json::Value>>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminateOwnedServerCapability {
+    pub completion_version: u32,
+    pub notification: bool,
+    pub query: bool,
+    pub retention_seconds: u64,
+    pub exit_confirmation: bool,
+    pub drain_confirmation: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerCapabilities {
+    pub terminate_owned: TerminateOwnedServerCapability,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct InitializeResponse {
@@ -77,6 +94,7 @@ pub struct InitializeResponse {
     /// Operating system for the running app-server target, for example
     /// `"macos"`, `"linux"`, or `"windows"`.
     pub platform_os: String,
+    pub capabilities: ServerCapabilities,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

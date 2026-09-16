@@ -22,6 +22,7 @@ pub struct StartedExecProcess {
     pub process: Arc<dyn ExecProcess>,
     /// `None` means the exec-server peer did not report its sandbox type.
     pub sandbox_type: Option<SandboxType>,
+    pub native_process_ownership: Option<crate::protocol::NativeProcessOwnership>,
 }
 
 pub(crate) fn sandbox_type_from_protocol(
@@ -214,6 +215,17 @@ pub trait ExecProcess: Send + Sync {
     fn signal(&self, signal: ProcessSignal) -> ExecProcessFuture<'_, ()>;
 
     fn terminate(&self) -> ExecProcessFuture<'_, ()>;
+
+    fn terminate_owned(
+        &self,
+        _params: crate::protocol::TerminateOwnedParams,
+    ) -> ExecProcessFuture<'_, crate::protocol::TerminateOwnedResponse> {
+        Box::pin(async {
+            Err(ExecServerError::Protocol(
+                "owned termination is unsupported by this process backend".to_string(),
+            ))
+        })
+    }
 }
 
 pub type ExecProcessFuture<'a, T> =

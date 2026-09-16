@@ -177,8 +177,11 @@ impl Default for UnifiedExecProcessManager {
 
 struct ProcessEntry {
     process: Arc<UnifiedExecProcess>,
+    ownership: ProcessOwnershipEvidence,
+    ownership_termination: OwnershipTerminationState,
     plugin_metrics_sidecar: Option<SharedPluginMetricsSidecar>,
     call_id: String,
+    turn_id: String,
     process_id: i32,
     cwd: PathUri,
     initial_exec_command_active: Arc<std::sync::atomic::AtomicBool>,
@@ -187,6 +190,37 @@ struct ProcessEntry {
     network_approval: Option<DeferredNetworkApproval>,
     session: Weak<Session>,
     last_used: tokio::time::Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnershipTerminationState {
+    Active,
+    Terminating,
+    Terminated(codex_exec_server_protocol::TerminateOwnedOutcome),
+}
+
+#[derive(Clone)]
+struct ProcessOwnershipEvidence {
+    native_process_ownership: Option<codex_exec_server::NativeProcessOwnership>,
+    command_signature: Option<SafeCommandSignature>,
+    identity_state: NativeIdentityState,
+    spawned_at: tokio::time::Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeIdentityState {
+    Unavailable,
+    Partial,
+    Complete,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct SafeCommandSignature([u8; 32]);
+
+impl std::fmt::Debug for SafeCommandSignature {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SafeCommandSignature([REDACTED])")
+    }
 }
 
 type SharedPluginMetricsSidecar = Arc<std::sync::Mutex<Option<PluginMetricsSidecar>>>;

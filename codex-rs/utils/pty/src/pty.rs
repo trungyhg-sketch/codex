@@ -171,6 +171,22 @@ async fn spawn_process_portable(
     }
 
     let mut child = pair.slave.spawn_command(command_builder)?;
+    let native_process_identity = child.process_id().and_then(|os_pid| {
+        #[cfg(windows)]
+        {
+            child.as_raw_handle().map(|handle| {
+                crate::native_process_identity::capture_native_process_identity(os_pid, handle)
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            Some(crate::native_process_identity::capture_native_process_identity(os_pid))
+        }
+    });
+    #[cfg(windows)]
+    let native_process_handle = child
+        .as_raw_handle()
+        .and_then(|handle| crate::native_process_identity::duplicate_process_handle(handle).ok());
     #[cfg(unix)]
     // portable-pty establishes the spawned PTY child as a new session leader on
     // Unix, so PID == PGID and we can reuse the pipe backend's process-group
@@ -245,6 +261,10 @@ async fn spawn_process_portable(
     };
 
     let handle = ProcessHandle::new(
+        native_process_identity,
+        #[cfg(windows)]
+        native_process_handle,
+        Some(crate::ProcessOwnershipToken::new()),
         writer_tx,
         Box::new(PtyChildTerminator {
             killer,
@@ -339,6 +359,8 @@ async fn spawn_process_preserving_fds(
     }
 
     let mut child = command.spawn()?;
+    let native_process_identity =
+        Some(crate::native_process_identity::capture_native_process_identity(child.id()));
     drop(slave);
     let process_group_id = child.id();
 
@@ -403,6 +425,11 @@ async fn spawn_process_preserving_fds(
     };
 
     let handle = ProcessHandle::new(
+        native_process_identity,
+        #[cfg(windows)]
+        /*native_process_handle*/
+        None,
+        Some(crate::ProcessOwnershipToken::new()),
         writer_tx,
         Box::new(RawPidTerminator { process_group_id }),
         reader_handle,

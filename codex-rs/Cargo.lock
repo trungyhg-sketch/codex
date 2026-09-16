@@ -2136,6 +2136,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "codex-app-server-protocol-noop-macros",
+ "codex-exec-server-protocol",
  "codex-experimental-api-macros",
  "codex-extension-items",
  "codex-history",
@@ -2760,6 +2761,7 @@ dependencies = [
  "codex-core-plugins",
  "codex-diagnostics",
  "codex-exec-server",
+ "codex-exec-server-protocol",
  "codex-exec-server-test-support",
  "codex-execpolicy",
  "codex-extension-api",
@@ -2841,6 +2843,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "sha1 0.10.6",
+ "sha2 0.10.9",
  "shlex",
  "similar",
  "tempfile",
@@ -3069,8 +3072,10 @@ dependencies = [
  "codex-shell-command",
  "codex-utils-path-uri",
  "pretty_assertions",
+ "schemars 0.8.22",
  "serde",
  "serde_json",
+ "ts-rs",
 ]
 
 [[package]]
@@ -4670,6 +4675,7 @@ dependencies = [
  "pretty_assertions",
  "shared_library",
  "tokio",
+ "uuid",
  "winapi",
 ]
 

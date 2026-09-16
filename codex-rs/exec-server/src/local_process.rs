@@ -52,14 +52,20 @@ use crate::protocol::ExecResponse;
 use crate::protocol::ExecServerNetworkProtocol;
 use crate::protocol::MAX_NETWORK_POLICY_PROCESS_ID_BYTES;
 use crate::protocol::NETWORK_POLICY_DECISION_METHOD;
+use crate::protocol::NativeProcessIdentity;
+use crate::protocol::NativeProcessOwnership;
 use crate::protocol::NetworkPolicyDecisionNotification;
 use crate::protocol::ProcessOutputChunk;
+use crate::protocol::ProcessOwnershipToken;
 use crate::protocol::ProcessSandboxType;
 use crate::protocol::ProcessSignal;
 use crate::protocol::ReadParams;
 use crate::protocol::ReadResponse;
 use crate::protocol::SignalParams;
 use crate::protocol::SignalResponse;
+use crate::protocol::TerminateOwnedOutcome;
+use crate::protocol::TerminateOwnedParams;
+use crate::protocol::TerminateOwnedResponse;
 use crate::protocol::TerminateParams;
 use crate::protocol::TerminateResponse;
 use crate::protocol::WriteParams;
@@ -406,6 +412,26 @@ impl LocalProcess {
                 return Err(internal_error(err.to_string()));
             }
         };
+        let native_process_ownership =
+            spawned
+                .session
+                .process_ownership_token()
+                .map(|token| NativeProcessOwnership {
+                    ownership_token: ProcessOwnershipToken::from_opaque(token.as_str().to_owned()),
+                    identity: spawned.session.native_process_identity().map(|identity| {
+                        NativeProcessIdentity {
+                            os_pid: identity.os_pid,
+                            creation_time: identity.creation_time,
+                            executable_identity: identity
+                                .executable_identity
+                                .as_ref()
+                                .map(|path| path.to_string_lossy().into_owned()),
+                            parent_pid: identity.parent_pid,
+                            parent_creation_time: identity.parent_creation_time,
+                            platform: identity.platform.to_string(),
+                        }
+                    }),
+                });
 
         let output_notify = Arc::new(Notify::new());
         let (wake_tx, _wake_rx) = watch::channel(0);
@@ -485,6 +511,7 @@ impl LocalProcess {
             ExecResponse {
                 process_id,
                 sandbox_type,
+                native_process_ownership,
             },
             wake_tx,
             events,
@@ -692,6 +719,108 @@ impl LocalProcess {
 
         Ok(TerminateResponse { running })
     }
+
+    pub(crate) async fn terminate_owned_process(
+        &self,
+        params: TerminateOwnedParams,
+    ) -> Result<TerminateOwnedResponse, JSONRPCErrorError> {
+        use TerminateOwnedOutcome::*;
+
+        let outcome = {
+            let mut process_map = self.inner.processes.lock().await;
+            let Some(ProcessEntry::Running(process)) = process_map.get_mut(&params.process_id)
+            else {
+                return Ok(TerminateOwnedResponse {
+                    outcome: if process_map.contains_key(&params.process_id) {
+                        NotTerminable
+                    } else {
+                        ProcessNotFound
+                    },
+                });
+            };
+            let Some(actual_token) = process.session.process_ownership_token() else {
+                return Ok(TerminateOwnedResponse {
+                    outcome: Unsupported,
+                });
+            };
+            if actual_token.as_str() != params.ownership_token.as_str() {
+                return Ok(TerminateOwnedResponse {
+                    outcome: OwnershipMismatch,
+                });
+            }
+            if process.termination_requested {
+                return Ok(TerminateOwnedResponse {
+                    outcome: Terminated,
+                });
+            }
+            if process.exit_code.is_some() || process.session.has_exited() {
+                return Ok(TerminateOwnedResponse {
+                    outcome: AlreadyExited,
+                });
+            }
+            let Some(platform) = protocol_identity_platform(&params.expected_identity.platform)
+            else {
+                return Ok(TerminateOwnedResponse {
+                    outcome: Unsupported,
+                });
+            };
+            let expected = codex_utils_pty::NativeProcessIdentity {
+                os_pid: params.expected_identity.os_pid,
+                creation_time: params.expected_identity.creation_time,
+                executable_identity: params
+                    .expected_identity
+                    .executable_identity
+                    .as_ref()
+                    .map(std::path::PathBuf::from),
+                parent_pid: params.expected_identity.parent_pid,
+                parent_creation_time: params.expected_identity.parent_creation_time,
+                platform,
+            };
+            match process
+                .session
+                .revalidate_native_process_identity(&expected)
+            {
+                codex_utils_pty::NativeProcessIdentityValidationResult::Match => {
+                    if let Some(network_policy_shutdown) = &process.network_policy_shutdown {
+                        network_policy_shutdown.cancel();
+                    }
+                    process.termination_requested = true;
+                    process.session.terminate();
+                    Terminated
+                }
+                codex_utils_pty::NativeProcessIdentityValidationResult::ProcessExited => {
+                    AlreadyExited
+                }
+                codex_utils_pty::NativeProcessIdentityValidationResult::PidMismatch
+                | codex_utils_pty::NativeProcessIdentityValidationResult::CreationTimeMismatch
+                | codex_utils_pty::NativeProcessIdentityValidationResult::ExecutableMismatch
+                | codex_utils_pty::NativeProcessIdentityValidationResult::ParentIdentityMismatch => {
+                    IdentityMismatch
+                }
+                codex_utils_pty::NativeProcessIdentityValidationResult::IdentityUnavailable => {
+                    IdentityUnavailable
+                }
+                codex_utils_pty::NativeProcessIdentityValidationResult::PartialIdentity => {
+                    PartialIdentity
+                }
+                codex_utils_pty::NativeProcessIdentityValidationResult::Unsupported => Unsupported,
+                codex_utils_pty::NativeProcessIdentityValidationResult::InternalError => {
+                    InternalError
+                }
+            }
+        };
+
+        Ok(TerminateOwnedResponse { outcome })
+    }
+}
+
+fn protocol_identity_platform(platform: &str) -> Option<&'static str> {
+    match platform {
+        "linux" => Some("linux"),
+        "windows" => Some("windows"),
+        "macos" => Some("macos"),
+        _ => None,
+    }
 }
 
 fn child_env(params: &ExecParams) -> HashMap<String, String> {
@@ -743,6 +872,7 @@ impl LocalProcess {
                 events,
             }),
             sandbox_type,
+            native_process_ownership: response.native_process_ownership,
         })
     }
 }
@@ -810,6 +940,20 @@ impl ExecProcess for LocalExecProcess {
 
     fn terminate(&self) -> ExecProcessFuture<'_, ()> {
         Box::pin(LocalExecProcess::terminate(self))
+    }
+
+    fn terminate_owned(
+        &self,
+        params: TerminateOwnedParams,
+    ) -> ExecProcessFuture<'_, TerminateOwnedResponse> {
+        Box::pin(async move {
+            self.backend
+                .terminate_owned_process(params)
+                .await
+                .map_err(|_| {
+                    ExecServerError::Protocol("owned termination request failed".to_string())
+                })
+        })
     }
 }
 
@@ -1167,6 +1311,170 @@ mod tests {
             managed_network: None,
             network_proxy: None,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn owned_termination_requires_token_and_live_identity() {
+        let backend = LocalProcess::default();
+        let mut params = test_exec_params(HashMap::new());
+        params.process_id = ProcessId::from("owned-termination");
+        params.argv = vec!["sleep".to_string(), "5".to_string()];
+        let response = backend.exec(params).await.expect("spawn owned process");
+        let ownership = response
+            .native_process_ownership
+            .expect("native ownership evidence");
+        let identity = ownership.identity.expect("complete Linux identity");
+
+        let wrong_token = backend
+            .terminate_owned_process(TerminateOwnedParams {
+                process_id: response.process_id.clone(),
+                ownership_token: ProcessOwnershipToken::from_opaque("wrong-token".to_string()),
+                expected_identity: identity.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            wrong_token.outcome,
+            TerminateOwnedOutcome::OwnershipMismatch
+        );
+
+        let mut wrong_identity = identity.clone();
+        wrong_identity.creation_time = wrong_identity.creation_time.map(|value| value + 1);
+        let mismatch = backend
+            .terminate_owned_process(TerminateOwnedParams {
+                process_id: response.process_id.clone(),
+                ownership_token: ownership.ownership_token.clone(),
+                expected_identity: wrong_identity,
+            })
+            .await
+            .unwrap();
+        assert_eq!(mismatch.outcome, TerminateOwnedOutcome::IdentityMismatch);
+
+        let mut partial_identity = identity.clone();
+        partial_identity.creation_time = None;
+        let partial = backend
+            .terminate_owned_process(TerminateOwnedParams {
+                process_id: response.process_id.clone(),
+                ownership_token: ownership.ownership_token.clone(),
+                expected_identity: partial_identity,
+            })
+            .await
+            .unwrap();
+        assert_eq!(partial.outcome, TerminateOwnedOutcome::PartialIdentity);
+
+        let request = TerminateOwnedParams {
+            process_id: response.process_id,
+            ownership_token: ownership.ownership_token,
+            expected_identity: identity,
+        };
+        let (first, duplicate) = tokio::join!(
+            backend.terminate_owned_process(request.clone()),
+            backend.terminate_owned_process(request)
+        );
+        assert_eq!(first.unwrap().outcome, TerminateOwnedOutcome::Terminated);
+        assert_eq!(
+            duplicate.unwrap().outcome,
+            TerminateOwnedOutcome::Terminated
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_termination_fails_closed_for_missing_and_driver_processes() {
+        let backend = LocalProcess::default();
+        let identity = NativeProcessIdentity {
+            os_pid: 1,
+            creation_time: Some(1),
+            executable_identity: Some("safe-placeholder".to_string()),
+            parent_pid: Some(1),
+            parent_creation_time: Some(1),
+            platform: std::env::consts::OS.to_string(),
+        };
+        let missing = backend
+            .terminate_owned_process(TerminateOwnedParams {
+                process_id: ProcessId::from("missing"),
+                ownership_token: ProcessOwnershipToken::from_opaque("opaque".to_string()),
+                expected_identity: identity.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(missing.outcome, TerminateOwnedOutcome::ProcessNotFound);
+
+        let driver = spawn_test_process(&backend, "driver-owned-termination").await;
+        let unsupported = backend
+            .terminate_owned_process(TerminateOwnedParams {
+                process_id: driver.process_id,
+                ownership_token: ProcessOwnershipToken::from_opaque("opaque".to_string()),
+                expected_identity: identity,
+            })
+            .await
+            .unwrap();
+        assert_eq!(unsupported.outcome, TerminateOwnedOutcome::Unsupported);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn owned_termination_handles_exit_and_registry_replacement_safely() {
+        let backend = LocalProcess::default();
+        let mut exited_params = test_exec_params(HashMap::new());
+        exited_params.process_id = ProcessId::from("owned-already-exited");
+        let exited_response = backend.exec(exited_params).await.unwrap();
+        let exited_ownership = exited_response.native_process_ownership.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let exited = backend
+            .terminate_owned_process(TerminateOwnedParams {
+                process_id: exited_response.process_id,
+                ownership_token: exited_ownership.ownership_token,
+                expected_identity: exited_ownership.identity.unwrap(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(exited.outcome, TerminateOwnedOutcome::AlreadyExited);
+
+        let process_id = ProcessId::from("owned-replacement");
+        let mut first_params = test_exec_params(HashMap::new());
+        first_params.process_id = process_id.clone();
+        first_params.argv = vec!["sleep".to_string(), "5".to_string()];
+        let first = backend.exec(first_params).await.unwrap();
+        let first_ownership = first.native_process_ownership.unwrap();
+        drop(backend.inner.processes.lock().await.remove(&process_id));
+
+        let mut replacement_params = test_exec_params(HashMap::new());
+        replacement_params.process_id = process_id.clone();
+        replacement_params.argv = vec!["sleep".to_string(), "5".to_string()];
+        let replacement = backend.exec(replacement_params).await.unwrap();
+        let replacement_ownership = replacement.native_process_ownership.unwrap();
+
+        let stale = backend
+            .terminate_owned_process(TerminateOwnedParams {
+                process_id: process_id.clone(),
+                ownership_token: first_ownership.ownership_token,
+                expected_identity: first_ownership.identity.clone().unwrap(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(stale.outcome, TerminateOwnedOutcome::OwnershipMismatch);
+
+        let reused_identity = backend
+            .terminate_owned_process(TerminateOwnedParams {
+                process_id: process_id.clone(),
+                ownership_token: replacement_ownership.ownership_token.clone(),
+                expected_identity: first_ownership.identity.unwrap(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            reused_identity.outcome,
+            TerminateOwnedOutcome::IdentityMismatch
+        );
+
+        let _ = backend
+            .terminate_owned_process(TerminateOwnedParams {
+                process_id,
+                ownership_token: replacement_ownership.ownership_token,
+                expected_identity: replacement_ownership.identity.unwrap(),
+            })
+            .await;
     }
 
     #[cfg(unix)]

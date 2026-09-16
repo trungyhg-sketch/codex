@@ -7,6 +7,715 @@ use tokio::time::Duration;
 use tokio::time::Instant;
 
 #[test]
+fn command_signature_is_deterministic_sensitive_to_material_changes_and_redacted() {
+    let cwd = PathUri::parse("file:///tmp/work").unwrap();
+    let command = vec!["sh".to_string(), "-c".to_string(), "echo safe".to_string()];
+    let same = command.clone();
+    let changed = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        "echo changed".to_string(),
+    ];
+
+    let first = safe_command_signature(&command, &cwd).unwrap();
+    assert_eq!(first, safe_command_signature(&same, &cwd).unwrap());
+    assert_ne!(first, safe_command_signature(&changed, &cwd).unwrap());
+    assert_eq!(format!("{first:?}"), "SafeCommandSignature([REDACTED])");
+}
+
+#[test]
+fn command_signature_excludes_environment_and_never_retains_raw_command() {
+    let cwd = PathUri::parse("file:///tmp/work").unwrap();
+    let secret = "sensitive-value-marker";
+    let signature = safe_command_signature(&["tool".to_string(), secret.to_string()], &cwd)
+        .expect("non-empty command should produce a digest");
+
+    assert!(!format!("{signature:?}").contains(secret));
+    assert!(safe_command_signature(&[], &cwd).is_none());
+}
+
+#[test]
+fn native_identity_state_is_fail_closed_for_missing_and_partial_metadata() {
+    assert_eq!(
+        native_identity_state(None),
+        NativeIdentityState::Unavailable
+    );
+    let ownership = codex_exec_server::NativeProcessOwnership {
+        ownership_token: codex_exec_server::ProcessOwnershipToken::from_opaque("opaque".into()),
+        identity: Some(codex_exec_server::NativeProcessIdentity {
+            os_pid: 123,
+            creation_time: None,
+            executable_identity: None,
+            parent_pid: None,
+            parent_creation_time: None,
+            platform: "driver".to_string(),
+        }),
+    };
+    assert_eq!(
+        native_identity_state(Some(&ownership)),
+        NativeIdentityState::Partial
+    );
+}
+
+#[cfg(unix)]
+fn ownership_test_entry(
+    process: Arc<UnifiedExecProcess>,
+    process_id: i32,
+    token: &str,
+    identity: Option<codex_exec_server::NativeProcessIdentity>,
+) -> ProcessEntry {
+    let now = Instant::now();
+    let native_process_ownership = Some(codex_exec_server::NativeProcessOwnership {
+        ownership_token: codex_exec_server::ProcessOwnershipToken::from_opaque(token.to_string()),
+        identity,
+    });
+    ProcessEntry {
+        process,
+        ownership: ProcessOwnershipEvidence {
+            identity_state: native_identity_state(native_process_ownership.as_ref()),
+            native_process_ownership,
+            command_signature: safe_command_signature(
+                &["safe-tool".to_string(), "safe-argument".to_string()],
+                &PathUri::parse("file:///tmp").unwrap(),
+            ),
+            spawned_at: now,
+        },
+        ownership_termination: OwnershipTerminationState::Active,
+        plugin_metrics_sidecar: None,
+        call_id: format!("call-{process_id}"),
+        turn_id: "turn".to_string(),
+        process_id,
+        cwd: PathUri::parse("file:///tmp").unwrap(),
+        initial_exec_command_active: Arc::new(AtomicBool::new(true)),
+        hook_command: String::new(),
+        tty: false,
+        network_approval: None,
+        session: std::sync::Weak::new(),
+        last_used: now,
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn process_store_preserves_concurrent_distinct_ownership_entries() {
+    let process = Arc::new(
+        crate::unified_exec::process_tests::remote_process(
+            codex_exec_server::WriteStatus::Accepted,
+            None,
+            codex_sandboxing::SandboxType::None,
+        )
+        .await,
+    );
+    let store = Arc::new(tokio::sync::Mutex::new(ProcessStore::default()));
+    let first_store = Arc::clone(&store);
+    let first_process = Arc::clone(&process);
+    let first = tokio::spawn(async move {
+        first_store.lock().await.processes.insert(
+            1001,
+            ownership_test_entry(first_process, 1001, "ownership-token-first", None),
+        );
+    });
+    let second_store = Arc::clone(&store);
+    let second_process = Arc::clone(&process);
+    let second = tokio::spawn(async move {
+        second_store.lock().await.processes.insert(
+            1002,
+            ownership_test_entry(second_process, 1002, "ownership-token-second", None),
+        );
+    });
+    first.await.unwrap();
+    second.await.unwrap();
+
+    let store = store.lock().await;
+    let first = store.processes.get(&1001).unwrap();
+    let second = store.processes.get(&1002).unwrap();
+    let first_token = first
+        .ownership
+        .native_process_ownership
+        .as_ref()
+        .unwrap()
+        .ownership_token
+        .as_str();
+    let second_token = second
+        .ownership
+        .native_process_ownership
+        .as_ref()
+        .unwrap()
+        .ownership_token
+        .as_str();
+
+    assert_eq!(first_token, "ownership-token-first");
+    assert_eq!(second_token, "ownership-token-second");
+    assert_ne!(first_token, second_token);
+    assert_eq!(
+        first.ownership.identity_state,
+        NativeIdentityState::Unavailable
+    );
+    assert_eq!(
+        second.ownership.identity_state,
+        NativeIdentityState::Unavailable
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn owned_termination_snapshot_uses_current_correlated_entry() {
+    let manager = UnifiedExecProcessManager::default();
+    let process = Arc::new(
+        crate::unified_exec::process_tests::remote_process(
+            codex_exec_server::WriteStatus::Accepted,
+            None,
+            codex_sandboxing::SandboxType::None,
+        )
+        .await,
+    );
+    let identity = complete_test_identity(4321);
+    manager.process_store.lock().await.processes.insert(
+        901,
+        ownership_test_entry(process, 901, "snapshot-token", Some(identity.clone())),
+    );
+
+    let snapshot = manager
+        .owned_termination_params("901", "turn", "call-901")
+        .await
+        .expect("complete current evidence should be available");
+    assert_eq!(snapshot.process_id.as_str(), "901");
+    assert_eq!(snapshot.expected_identity, identity);
+    assert_eq!(snapshot.ownership_token.as_str(), "snapshot-token");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn owned_termination_snapshot_fails_closed_for_missing_or_partial_identity() {
+    let manager = UnifiedExecProcessManager::default();
+    let process = Arc::new(
+        crate::unified_exec::process_tests::remote_process(
+            codex_exec_server::WriteStatus::Accepted,
+            None,
+            codex_sandboxing::SandboxType::None,
+        )
+        .await,
+    );
+    manager.process_store.lock().await.processes.insert(
+        902,
+        ownership_test_entry(Arc::clone(&process), 902, "missing", None),
+    );
+    manager.process_store.lock().await.processes.insert(
+        903,
+        ownership_test_entry(
+            process,
+            903,
+            "partial",
+            Some(codex_exec_server::NativeProcessIdentity {
+                os_pid: 4321,
+                creation_time: None,
+                executable_identity: None,
+                parent_pid: None,
+                parent_creation_time: None,
+                platform: "linux".to_string(),
+            }),
+        ),
+    );
+
+    assert_eq!(
+        manager
+            .owned_termination_params("902", "turn", "call-902")
+            .await,
+        None
+    );
+    assert_eq!(
+        manager
+            .owned_termination_params("903", "turn", "call-903")
+            .await,
+        None
+    );
+    assert_eq!(
+        manager
+            .owned_termination_params("999", "turn", "call-999")
+            .await,
+        None
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn owned_termination_snapshot_rejects_stale_correlation_after_replacement() {
+    let manager = UnifiedExecProcessManager::default();
+    let process = Arc::new(
+        crate::unified_exec::process_tests::remote_process(
+            codex_exec_server::WriteStatus::Accepted,
+            None,
+            codex_sandboxing::SandboxType::None,
+        )
+        .await,
+    );
+    let mut replacement = ownership_test_entry(
+        process,
+        904,
+        "replacement-token",
+        Some(complete_test_identity(9876)),
+    );
+    replacement.call_id = "replacement-call".to_string();
+    replacement.turn_id = "replacement-turn".to_string();
+    manager
+        .process_store
+        .lock()
+        .await
+        .processes
+        .insert(904, replacement);
+
+    assert_eq!(
+        manager
+            .owned_termination_params("904", "turn", "call-904")
+            .await,
+        None
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn process_entry_ownership_is_stable_across_lifecycle_and_replacement() {
+    let process = Arc::new(
+        crate::unified_exec::process_tests::remote_process(
+            codex_exec_server::WriteStatus::Accepted,
+            None,
+            codex_sandboxing::SandboxType::None,
+        )
+        .await,
+    );
+    let mut store = ProcessStore::default();
+    store.processes.insert(
+        2001,
+        ownership_test_entry(Arc::clone(&process), 2001, "ownership-token-original", None),
+    );
+    let original_token = store.processes[&2001]
+        .ownership
+        .native_process_ownership
+        .as_ref()
+        .unwrap()
+        .ownership_token
+        .as_str()
+        .to_string();
+
+    process.terminate_confirmed().await.unwrap();
+    assert_eq!(
+        store.processes[&2001]
+            .ownership
+            .native_process_ownership
+            .as_ref()
+            .unwrap()
+            .ownership_token
+            .as_str(),
+        original_token
+    );
+
+    let replacement = ownership_test_entry(
+        Arc::clone(&process),
+        2001,
+        "ownership-token-replacement",
+        None,
+    );
+    let removed = store.processes.insert(2001, replacement).unwrap();
+    assert_eq!(
+        removed
+            .ownership
+            .native_process_ownership
+            .as_ref()
+            .unwrap()
+            .ownership_token
+            .as_str(),
+        original_token
+    );
+    assert_eq!(
+        store.processes[&2001]
+            .ownership
+            .native_process_ownership
+            .as_ref()
+            .unwrap()
+            .ownership_token
+            .as_str(),
+        "ownership-token-replacement"
+    );
+    assert_ne!(
+        store.processes[&2001]
+            .ownership
+            .native_process_ownership
+            .as_ref()
+            .unwrap()
+            .ownership_token
+            .as_str(),
+        original_token
+    );
+}
+
+#[cfg(unix)]
+fn complete_test_identity(pid: u32) -> codex_exec_server::NativeProcessIdentity {
+    codex_exec_server::NativeProcessIdentity {
+        os_pid: pid,
+        creation_time: Some(42),
+        executable_identity: Some("/safe/test-executable".to_string()),
+        parent_pid: Some(1),
+        parent_creation_time: Some(1),
+        platform: "linux".to_string(),
+    }
+}
+
+#[cfg(unix)]
+fn owned_params(
+    process_id: i32,
+    token: &str,
+    identity: codex_exec_server::NativeProcessIdentity,
+) -> codex_exec_server_protocol::TerminateOwnedParams {
+    codex_exec_server_protocol::TerminateOwnedParams {
+        process_id: process_id.to_string().into(),
+        ownership_token: codex_exec_server::ProcessOwnershipToken::from_opaque(token.to_string()),
+        expected_identity: identity,
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn owned_termination_is_idempotent_and_never_uses_legacy_remote_terminate() {
+    use std::sync::atomic::Ordering;
+
+    let process_id = 3001;
+    let token = "owned-token";
+    let identity = complete_test_identity(301);
+    let (process, control) = crate::unified_exec::process_tests::owned_remote_process(
+        process_id,
+        token,
+        identity.clone(),
+        false,
+        codex_exec_server_protocol::TerminateOwnedOutcome::Terminated,
+    )
+    .await;
+    let manager = UnifiedExecProcessManager::default();
+    manager.process_store.lock().await.processes.insert(
+        process_id,
+        ownership_test_entry(Arc::new(process), process_id, token, Some(identity.clone())),
+    );
+    let params = owned_params(process_id, token, identity);
+
+    assert_eq!(
+        manager.terminate_owned_process(params.clone()).await,
+        codex_exec_server_protocol::TerminateOwnedOutcome::Terminated
+    );
+    assert_eq!(
+        manager.terminate_owned_process(params).await,
+        codex_exec_server_protocol::TerminateOwnedOutcome::Terminated
+    );
+    assert_eq!(control.owned_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(control.legacy_calls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn concurrent_duplicate_owned_termination_invokes_underlying_once() {
+    use std::sync::atomic::Ordering;
+
+    let process_id = 3005;
+    let token = "concurrent-token";
+    let identity = complete_test_identity(306);
+    let (process, control) = crate::unified_exec::process_tests::owned_remote_process(
+        process_id,
+        token,
+        identity.clone(),
+        true,
+        codex_exec_server_protocol::TerminateOwnedOutcome::Terminated,
+    )
+    .await;
+    let manager = Arc::new(UnifiedExecProcessManager::default());
+    manager.process_store.lock().await.processes.insert(
+        process_id,
+        ownership_test_entry(Arc::new(process), process_id, token, Some(identity.clone())),
+    );
+    let params = owned_params(process_id, token, identity);
+    let entered = control.entered.notified();
+    let first_manager = Arc::clone(&manager);
+    let first_params = params.clone();
+    let first =
+        tokio::spawn(async move { first_manager.terminate_owned_process(first_params).await });
+    entered.await;
+    let second_manager = Arc::clone(&manager);
+    let second = tokio::spawn(async move { second_manager.terminate_owned_process(params).await });
+    control.release.notify_one();
+
+    assert_eq!(
+        first.await.unwrap(),
+        codex_exec_server_protocol::TerminateOwnedOutcome::Terminated
+    );
+    assert_eq!(
+        second.await.unwrap(),
+        codex_exec_server_protocol::TerminateOwnedOutcome::Terminated
+    );
+    assert_eq!(control.owned_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(control.legacy_calls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn owned_termination_rejects_wrong_stale_and_unavailable_evidence() {
+    use std::sync::atomic::Ordering;
+
+    let process_id = 3002;
+    let identity = complete_test_identity(302);
+    let (process, control) = crate::unified_exec::process_tests::owned_remote_process(
+        process_id,
+        "current-token",
+        identity.clone(),
+        false,
+        codex_exec_server_protocol::TerminateOwnedOutcome::Terminated,
+    )
+    .await;
+    let manager = UnifiedExecProcessManager::default();
+    manager.process_store.lock().await.processes.insert(
+        process_id,
+        ownership_test_entry(
+            Arc::new(process),
+            process_id,
+            "current-token",
+            Some(identity.clone()),
+        ),
+    );
+
+    assert_eq!(
+        manager
+            .terminate_owned_process(owned_params(process_id, "old-token", identity.clone()))
+            .await,
+        codex_exec_server_protocol::TerminateOwnedOutcome::OwnershipMismatch
+    );
+    let mut stale = identity.clone();
+    stale.creation_time = Some(41);
+    assert_eq!(
+        manager
+            .terminate_owned_process(owned_params(process_id, "current-token", stale))
+            .await,
+        codex_exec_server_protocol::TerminateOwnedOutcome::StaleEvidence
+    );
+    manager
+        .process_store
+        .lock()
+        .await
+        .processes
+        .get_mut(&process_id)
+        .unwrap()
+        .ownership
+        .identity_state = NativeIdentityState::Unavailable;
+    assert_eq!(
+        manager
+            .terminate_owned_process(owned_params(process_id, "current-token", identity.clone()))
+            .await,
+        codex_exec_server_protocol::TerminateOwnedOutcome::IdentityUnavailable
+    );
+    manager
+        .process_store
+        .lock()
+        .await
+        .processes
+        .get_mut(&process_id)
+        .unwrap()
+        .ownership
+        .identity_state = NativeIdentityState::Partial;
+    assert_eq!(
+        manager
+            .terminate_owned_process(owned_params(process_id, "current-token", identity.clone()))
+            .await,
+        codex_exec_server_protocol::TerminateOwnedOutcome::PartialIdentity
+    );
+    manager
+        .process_store
+        .lock()
+        .await
+        .processes
+        .get_mut(&process_id)
+        .unwrap()
+        .ownership
+        .native_process_ownership = None;
+    assert_eq!(
+        manager
+            .terminate_owned_process(owned_params(process_id, "current-token", identity))
+            .await,
+        codex_exec_server_protocol::TerminateOwnedOutcome::Unsupported
+    );
+    assert_eq!(control.owned_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(control.legacy_calls.load(Ordering::SeqCst), 0);
+
+    let restarted = UnifiedExecProcessManager::default();
+    assert_eq!(
+        restarted
+            .terminate_owned_process(owned_params(
+                process_id,
+                "current-token",
+                complete_test_identity(302),
+            ))
+            .await,
+        codex_exec_server_protocol::TerminateOwnedOutcome::ProcessNotFound
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn exited_during_owned_termination_is_stable_and_idempotent() {
+    use std::sync::atomic::Ordering;
+
+    let process_id = 3006;
+    let token = "exited-token";
+    let identity = complete_test_identity(307);
+    let (process, control) = crate::unified_exec::process_tests::owned_remote_process(
+        process_id,
+        token,
+        identity.clone(),
+        false,
+        codex_exec_server_protocol::TerminateOwnedOutcome::AlreadyExited,
+    )
+    .await;
+    let manager = UnifiedExecProcessManager::default();
+    manager.process_store.lock().await.processes.insert(
+        process_id,
+        ownership_test_entry(Arc::new(process), process_id, token, Some(identity.clone())),
+    );
+    let params = owned_params(process_id, token, identity);
+
+    assert_eq!(
+        manager.terminate_owned_process(params.clone()).await,
+        codex_exec_server_protocol::TerminateOwnedOutcome::AlreadyExited
+    );
+    assert_eq!(
+        manager.terminate_owned_process(params).await,
+        codex_exec_server_protocol::TerminateOwnedOutcome::AlreadyExited
+    );
+    assert_eq!(control.owned_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(control.legacy_calls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn concurrent_owned_termination_releases_store_and_protects_replacement() {
+    use std::sync::atomic::Ordering;
+
+    let process_id = 3003;
+    let token = "original-token";
+    let identity = complete_test_identity(303);
+    let (process, control) = crate::unified_exec::process_tests::owned_remote_process(
+        process_id,
+        token,
+        identity.clone(),
+        true,
+        codex_exec_server_protocol::TerminateOwnedOutcome::Terminated,
+    )
+    .await;
+    let manager = Arc::new(UnifiedExecProcessManager::default());
+    manager.process_store.lock().await.processes.insert(
+        process_id,
+        ownership_test_entry(Arc::new(process), process_id, token, Some(identity.clone())),
+    );
+    let params = owned_params(process_id, token, identity.clone());
+    let entered = control.entered.notified();
+    let first_manager = Arc::clone(&manager);
+    let first_params = params.clone();
+    let first =
+        tokio::spawn(async move { first_manager.terminate_owned_process(first_params).await });
+    entered.await;
+
+    // Acquiring and mutating ProcessStore while the mocked RPC is blocked proves
+    // the store mutex is not held across the termination await.
+    manager.release_process_id(process_id).await;
+    assert!(
+        manager
+            .process_store
+            .lock()
+            .await
+            .processes
+            .contains_key(&process_id)
+    );
+
+    let (replacement, _) = crate::unified_exec::process_tests::owned_remote_process(
+        process_id,
+        "replacement-token",
+        complete_test_identity(304),
+        false,
+        codex_exec_server_protocol::TerminateOwnedOutcome::Terminated,
+    )
+    .await;
+    manager.process_store.lock().await.processes.insert(
+        process_id,
+        ownership_test_entry(
+            Arc::new(replacement),
+            process_id,
+            "replacement-token",
+            Some(complete_test_identity(304)),
+        ),
+    );
+    control.release.notify_one();
+
+    assert_eq!(
+        first.await.unwrap(),
+        codex_exec_server_protocol::TerminateOwnedOutcome::Terminated
+    );
+    let store = manager.process_store.lock().await;
+    let replacement = store.processes.get(&process_id).unwrap();
+    assert_eq!(
+        replacement.ownership_termination,
+        OwnershipTerminationState::Active
+    );
+    assert_eq!(
+        replacement
+            .ownership
+            .native_process_ownership
+            .as_ref()
+            .unwrap()
+            .ownership_token
+            .as_str(),
+        "replacement-token"
+    );
+    drop(store);
+    assert_eq!(
+        manager.terminate_owned_process(params).await,
+        codex_exec_server_protocol::TerminateOwnedOutcome::OwnershipMismatch
+    );
+    assert_eq!(control.owned_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(control.legacy_calls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pruning_skips_an_entry_while_owned_termination_is_in_flight() {
+    let process_id = 3004;
+    let identity = complete_test_identity(305);
+    let process = Arc::new(
+        crate::unified_exec::process_tests::remote_process(
+            codex_exec_server::WriteStatus::Accepted,
+            None,
+            codex_sandboxing::SandboxType::None,
+        )
+        .await,
+    );
+    let mut store = ProcessStore::default();
+    for id in 3004..(3004 + MAX_UNIFIED_EXEC_PROCESSES as i32) {
+        store.processes.insert(
+            id,
+            ownership_test_entry(
+                Arc::clone(&process),
+                id,
+                &format!("token-{id}"),
+                Some(identity.clone()),
+            ),
+        );
+    }
+    store.processes.get_mut(&process_id).unwrap().last_used =
+        Instant::now() - Duration::from_secs(60);
+    store
+        .processes
+        .get_mut(&process_id)
+        .unwrap()
+        .ownership_termination = OwnershipTerminationState::Terminating;
+
+    let pruned = UnifiedExecProcessManager::prune_processes_if_needed(&mut store);
+    assert_ne!(pruned.map(|entry| entry.process_id), Some(process_id));
+    assert!(store.processes.contains_key(&process_id));
+}
+
+#[test]
 fn unified_exec_env_injects_defaults() {
     let env = apply_unified_exec_env(HashMap::new());
     let expected = HashMap::from([
@@ -582,8 +1291,16 @@ async fn pruning_does_not_evict_live_process_while_exited_process_is_finalizing(
                 } else {
                     Arc::clone(&live_process)
                 },
+                ownership: ProcessOwnershipEvidence {
+                    native_process_ownership: None,
+                    command_signature: None,
+                    identity_state: NativeIdentityState::Unavailable,
+                    spawned_at: now,
+                },
+                ownership_termination: OwnershipTerminationState::Active,
                 plugin_metrics_sidecar: None,
                 call_id: format!("call-{process_id}"),
+                turn_id: "turn".to_string(),
                 process_id,
                 cwd: cwd.clone(),
                 initial_exec_command_active: Arc::new(AtomicBool::new(false)),

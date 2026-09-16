@@ -11,8 +11,10 @@ use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
 use codex_shell_command::shell_detect::DetectedShell;
 use codex_utils_path_uri::PathUri;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
+use ts_rs::TS;
 
 use crate::ProcessId;
 
@@ -23,6 +25,7 @@ pub const EXEC_READ_METHOD: &str = "process/read";
 pub const EXEC_WRITE_METHOD: &str = "process/write";
 pub const EXEC_SIGNAL_METHOD: &str = "process/signal";
 pub const EXEC_TERMINATE_METHOD: &str = "process/terminate";
+pub const EXEC_TERMINATE_OWNED_METHOD: &str = "process/terminateOwned";
 pub const EXEC_OUTPUT_DELTA_METHOD: &str = "process/output";
 pub const EXEC_EXITED_METHOD: &str = "process/exited";
 pub const EXEC_CLOSED_METHOD: &str = "process/closed";
@@ -283,6 +286,52 @@ pub struct ExecResponse {
     /// report [`ProcessSandboxType::None`] when the process was not sandboxed.
     #[serde(default)]
     pub sandbox_type: Option<ProcessSandboxType>,
+    /// Spawn-time evidence reported by the native process owner. Older peers
+    /// and non-native drivers leave this absent and must be treated fail-closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_process_ownership: Option<NativeProcessOwnership>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(transparent)]
+#[ts(export_to = "v2/")]
+pub struct ProcessOwnershipToken(String);
+
+impl ProcessOwnershipToken {
+    pub fn from_opaque(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for ProcessOwnershipToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ProcessOwnershipToken([REDACTED])")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct NativeProcessIdentity {
+    pub os_pid: u32,
+    pub creation_time: Option<u64>,
+    pub executable_identity: Option<String>,
+    pub parent_pid: Option<u32>,
+    pub parent_creation_time: Option<u64>,
+    pub platform: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeProcessOwnership {
+    pub ownership_token: ProcessOwnershipToken,
+    /// Absent when the native owner could not capture OS identity at spawn.
+    /// The token still proves record ownership, but identity is fail-closed.
+    pub identity: Option<NativeProcessIdentity>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -376,6 +425,51 @@ pub struct TerminateParams {
 #[serde(rename_all = "camelCase")]
 pub struct TerminateResponse {
     pub running: bool,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TerminateOwnedParams {
+    pub process_id: ProcessId,
+    pub ownership_token: ProcessOwnershipToken,
+    pub expected_identity: NativeProcessIdentity,
+}
+
+impl std::fmt::Debug for TerminateOwnedParams {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TerminateOwnedParams")
+            .field("process_id", &self.process_id)
+            .field("ownership_token", &self.ownership_token)
+            .field("expected_identity", &self.expected_identity)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[ts(rename_all = "SCREAMING_SNAKE_CASE", export_to = "v2/")]
+pub enum TerminateOwnedOutcome {
+    Terminated,
+    AlreadyExited,
+    ProcessNotFound,
+    OwnershipMismatch,
+    IdentityMismatch,
+    IdentityUnavailable,
+    PartialIdentity,
+    ProcessReplaced,
+    StaleEvidence,
+    NotTerminable,
+    Unsupported,
+    InternalError,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TerminateOwnedResponse {
+    pub outcome: TerminateOwnedOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -841,7 +935,10 @@ mod tests {
     use super::ExecResponse;
     use super::FsReadFileParams;
     use super::HttpRequestParams;
+    use super::NativeProcessIdentity;
+    use super::NativeProcessOwnership;
     use super::ProcessId;
+    use super::ProcessOwnershipToken;
     use super::ProcessSandboxType;
     use super::ShellInfo;
     use codex_file_system::FileSystemSandboxContext;
@@ -1263,6 +1360,67 @@ mod tests {
         assert_eq!(
             (unknown.sandbox_type, unsandboxed.sandbox_type),
             (None, Some(ProcessSandboxType::None))
+        );
+        assert!(unknown.native_process_ownership.is_none());
+    }
+
+    #[test]
+    fn native_process_ownership_round_trips_with_redacted_debug_token() {
+        let ownership = NativeProcessOwnership {
+            ownership_token: ProcessOwnershipToken::from_opaque(
+                "0f44df27-a804-4bf0-b735-8c445ce4d08b".to_string(),
+            ),
+            identity: Some(NativeProcessIdentity {
+                os_pid: 42,
+                creation_time: Some(100),
+                executable_identity: Some("/usr/bin/printf".to_string()),
+                parent_pid: Some(7),
+                parent_creation_time: Some(50),
+                platform: "linux".to_string(),
+            }),
+        };
+        let serialized = serde_json::to_string(&ownership).unwrap();
+        let round_trip: NativeProcessOwnership = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(round_trip, ownership);
+        assert!(
+            !format!("{:?}", ownership.ownership_token)
+                .contains(ownership.ownership_token.as_str())
+        );
+    }
+
+    #[test]
+    fn terminate_owned_contract_round_trips_without_debug_token_exposure() {
+        let token_value = "7c550e93-8837-4ed5-a86a-ef6aebcc31e6";
+        let request = super::TerminateOwnedParams {
+            process_id: ProcessId::from("owned-process"),
+            ownership_token: ProcessOwnershipToken::from_opaque(token_value.to_string()),
+            expected_identity: NativeProcessIdentity {
+                os_pid: 42,
+                creation_time: Some(100),
+                executable_identity: Some("/usr/bin/safe-tool".to_string()),
+                parent_pid: Some(7),
+                parent_creation_time: Some(50),
+                platform: "linux".to_string(),
+            },
+        };
+        let serialized = serde_json::to_string(&request).unwrap();
+        let round_trip: super::TerminateOwnedParams = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(round_trip, request);
+        assert!(!format!("{request:?}").contains(token_value));
+        assert!(!serialized.contains("command"));
+        assert!(!serialized.contains("environment"));
+
+        let response = super::TerminateOwnedResponse {
+            outcome: super::TerminateOwnedOutcome::IdentityMismatch,
+        };
+        assert_eq!(
+            serde_json::from_str::<super::TerminateOwnedResponse>(
+                &serde_json::to_string(&response).unwrap()
+            )
+            .unwrap(),
+            response
         );
     }
 }

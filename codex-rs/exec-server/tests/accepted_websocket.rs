@@ -232,6 +232,7 @@ async fn accepted_websocket_reconnect_recovers_running_process_and_output() -> R
             result: serde_json::to_value(ExecResponse {
                 process_id: process_id.clone(),
                 sandbox_type: None,
+                native_process_ownership: None,
             })?,
         }),
     )

@@ -678,6 +678,18 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadBackgroundTerminalsTerminateResponse,
     },
+    #[experimental("item/commandExecution/terminateOwned")]
+    CommandExecutionTerminateOwned => "item/commandExecution/terminateOwned" {
+        params: v2::CommandExecutionTerminateOwnedParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::CommandExecutionTerminateOwnedResponse,
+    },
+    #[experimental("item/commandExecution/terminateOwned/status")]
+    CommandExecutionTerminateOwnedStatus => "item/commandExecution/terminateOwned/status" {
+        params: v2::CommandExecutionTerminateOwnedStatusParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::CommandExecutionTerminateOwnedStatusResponse,
+    },
     ThreadRollback => "thread/rollback" {
         params: v2::ThreadRollbackParams,
         serialization: thread_id(params.thread_id),
@@ -1850,6 +1862,10 @@ server_notification_definitions! {
     TurnDiffUpdated => "turn/diff/updated" (v2::TurnDiffUpdatedNotification),
     TurnPlanUpdated => "turn/plan/updated" (v2::TurnPlanUpdatedNotification),
     ItemStarted => "item/started" (v2::ItemStartedNotification),
+    #[experimental("item/commandExecution/ownershipEvidence")]
+    CommandExecutionOwnershipEvidence => "item/commandExecution/ownershipEvidence" (v2::CommandExecutionOwnershipEvidenceNotification),
+    #[experimental("item/commandExecution/terminateOwned/completed")]
+    CommandExecutionTerminateOwnedCompleted => "item/commandExecution/terminateOwned/completed" (v2::CommandExecutionTerminateOwnedCompletedNotification),
     ItemGuardianApprovalReviewStarted => "item/autoApprovalReview/started" (v2::ItemGuardianApprovalReviewStartedNotification),
     ItemGuardianApprovalReviewCompleted => "item/autoApprovalReview/completed" (v2::ItemGuardianApprovalReviewCompletedNotification),
     #[experimental("autoApprovalReview/strictReviewRequired")]

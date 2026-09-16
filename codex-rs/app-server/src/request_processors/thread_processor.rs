@@ -5,6 +5,11 @@ use super::thread_fork_goal::inherit_thread_goal_snapshot;
 use super::turn_processor::can_accept_direct_input;
 use super::*;
 use crate::error_code::method_not_found;
+use crate::terminate_owned_operation_registry::ReserveResult;
+use crate::terminate_owned_operation_registry::TERMINATE_OWNED_COMPLETION_VERSION;
+use crate::terminate_owned_operation_registry::TerminateOwnedCorrelation;
+use crate::terminate_owned_operation_registry::TerminateOwnedOperationRegistry;
+use crate::terminate_owned_operation_registry::valid_termination_operation_id;
 use codex_app_server_protocol::SelectedCapabilityRoot;
 use codex_app_server_protocol::ThreadRevertParams;
 use codex_app_server_protocol::ThreadRevertResponse;
@@ -26,6 +31,24 @@ pub(super) const THREAD_LIST_MAX_LIMIT: usize = 100;
 const CODEX_TUI_CLIENT_NAME: &str = "codex-tui";
 const THREAD_ROLLBACK_DEPRECATION_SUMMARY: &str =
     "thread/rollback is deprecated and will be removed soon";
+
+fn unix_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn unknown_operation_status(operation_id: String) -> CommandExecutionTerminateOwnedStatusResponse {
+    CommandExecutionTerminateOwnedStatusResponse {
+        state: TerminateOwnedOperationState::Unknown,
+        operation_id,
+        created_at: None,
+        accepted_at: None,
+        initial_outcome: None,
+        completion: None,
+    }
+}
 
 async fn stage_pending_project_metadata(
     thread_manager: &ThreadManager,
@@ -441,6 +464,7 @@ pub(crate) struct ThreadRequestProcessor {
     pub(super) skills_watcher: Arc<SkillsWatcher>,
     pub(super) turn_cost_worker: Option<crate::turn_cost_worker::TurnCostWorkerHandle>,
     pub(super) initial_config_warnings: Arc<Vec<ConfigWarningNotification>>,
+    pub(super) terminate_owned_operations: TerminateOwnedOperationRegistry,
 }
 
 /// Outcome of trying to satisfy a resume request from an already loaded thread.
@@ -494,6 +518,7 @@ impl ThreadRequestProcessor {
             skills_watcher,
             turn_cost_worker,
             initial_config_warnings: Arc::new(initial_config_warnings),
+            terminate_owned_operations: TerminateOwnedOperationRegistry::new(),
         }
     }
 
@@ -777,6 +802,152 @@ impl ThreadRequestProcessor {
         self.thread_background_terminals_terminate_inner(params)
             .await
             .map(|response| Some(response.into()))
+    }
+
+    pub(crate) async fn command_execution_terminate_owned(
+        &self,
+        params: CommandExecutionTerminateOwnedParams,
+        completion_v1: bool,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let CommandExecutionTerminateOwnedParams {
+            thread_id,
+            turn_id,
+            item_id,
+            termination,
+            operation_id,
+        } = params;
+        let now = unix_timestamp();
+        let correlation = TerminateOwnedCorrelation {
+            thread_id: thread_id.clone(),
+            turn_id: turn_id.clone(),
+            item_id: item_id.clone(),
+            termination: termination.clone(),
+        };
+        if completion_v1 {
+            let Some(operation_id) = operation_id
+                .as_deref()
+                .filter(|id| valid_termination_operation_id(id))
+            else {
+                return Ok(Some(
+                    CommandExecutionTerminateOwnedResponse {
+                        outcome: TerminateOwnedOutcome::InternalError,
+                        operation_id,
+                        phase: Some(TerminateOwnedAckPhase::Refused),
+                        reason: Some("invalid_operation_id".to_string()),
+                        completion_version: Some(TERMINATE_OWNED_COMPLETION_VERSION),
+                    }
+                    .into(),
+                ));
+            };
+            match self
+                .terminate_owned_operations
+                .reserve(operation_id, correlation.clone(), now)
+                .await
+            {
+                ReserveResult::Duplicate(status) => {
+                    return Ok(Some(
+                        CommandExecutionTerminateOwnedResponse {
+                            outcome: status
+                                .initial_outcome
+                                .unwrap_or(TerminateOwnedOutcome::Terminated),
+                            operation_id: Some(operation_id.to_string()),
+                            phase: Some(TerminateOwnedAckPhase::Accepted),
+                            reason: Some("duplicate_idempotent".to_string()),
+                            completion_version: Some(TERMINATE_OWNED_COMPLETION_VERSION),
+                        }
+                        .into(),
+                    ));
+                }
+                ReserveResult::Conflict => {
+                    return Ok(Some(
+                        CommandExecutionTerminateOwnedResponse {
+                            outcome: TerminateOwnedOutcome::InternalError,
+                            operation_id: Some(operation_id.to_string()),
+                            phase: Some(TerminateOwnedAckPhase::Refused),
+                            reason: Some("operation_id_conflict".to_string()),
+                            completion_version: Some(TERMINATE_OWNED_COMPLETION_VERSION),
+                        }
+                        .into(),
+                    ));
+                }
+                ReserveResult::Full => {
+                    return Ok(Some(
+                        CommandExecutionTerminateOwnedResponse {
+                            outcome: TerminateOwnedOutcome::InternalError,
+                            operation_id: Some(operation_id.to_string()),
+                            phase: Some(TerminateOwnedAckPhase::Refused),
+                            reason: Some("operation_registry_full".to_string()),
+                            completion_version: Some(TERMINATE_OWNED_COMPLETION_VERSION),
+                        }
+                        .into(),
+                    ));
+                }
+                ReserveResult::Reserved => {}
+            }
+        }
+        let thread = match self.load_thread(&thread_id).await {
+            Ok((_, thread)) => thread,
+            Err(error) => {
+                if completion_v1 && let Some(operation_id) = operation_id.as_deref() {
+                    self.terminate_owned_operations.refuse(operation_id).await;
+                }
+                return Err(error);
+            }
+        };
+        let outcome = thread
+            .terminate_owned_command_execution(&turn_id, &item_id, termination)
+            .await;
+        let accepted = matches!(
+            outcome,
+            TerminateOwnedOutcome::Terminated | TerminateOwnedOutcome::AlreadyExited
+        );
+        if completion_v1 && let Some(operation_id) = operation_id.as_deref() {
+            if accepted {
+                self.terminate_owned_operations
+                    .accept(operation_id, outcome, unix_timestamp())
+                    .await;
+            } else {
+                self.terminate_owned_operations.refuse(operation_id).await;
+            }
+        }
+        Ok(Some(
+            CommandExecutionTerminateOwnedResponse {
+                outcome,
+                operation_id: completion_v1.then_some(operation_id).flatten(),
+                phase: completion_v1.then_some(if accepted {
+                    TerminateOwnedAckPhase::Accepted
+                } else {
+                    TerminateOwnedAckPhase::Refused
+                }),
+                reason: None,
+                completion_version: completion_v1.then_some(TERMINATE_OWNED_COMPLETION_VERSION),
+            }
+            .into(),
+        ))
+    }
+
+    pub(crate) async fn command_execution_terminate_owned_status(
+        &self,
+        params: CommandExecutionTerminateOwnedStatusParams,
+        completion_v1: bool,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let operation_id = params.operation_id;
+        if !completion_v1 || !valid_termination_operation_id(&operation_id) {
+            return Ok(Some(unknown_operation_status(operation_id).into()));
+        }
+        let response = self
+            .terminate_owned_operations
+            .status_by_identity(
+                &operation_id,
+                &params.thread_id,
+                &params.turn_id,
+                &params.item_id,
+                &params.process_identity,
+                unix_timestamp(),
+            )
+            .await
+            .unwrap_or_else(|| unknown_operation_status(operation_id));
+        Ok(Some(response.into()))
     }
 
     pub(crate) async fn thread_rollback(

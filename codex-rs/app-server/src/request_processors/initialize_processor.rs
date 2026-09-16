@@ -71,6 +71,11 @@ impl InitializeRequestProcessor {
         let experimental_api_enabled = capabilities.experimental_api;
         let request_attestation = capabilities.request_attestation;
         let extensions = capabilities.extensions.as_ref();
+        let terminate_owned_completion_v1 = extensions
+            .and_then(|extensions| extensions.get("openai/terminate-owned-completion"))
+            .and_then(|value| value.get("version"))
+            .and_then(serde_json::Value::as_u64)
+            == Some(1);
         let client_mcp_extensions = codex_mcp::client_mcp_extensions(
             extensions,
             capabilities.mcp_server_openai_form_elicitation,
@@ -102,6 +107,7 @@ impl InitializeRequestProcessor {
                 client_version: version,
                 request_attestation,
                 client_mcp_extensions,
+                terminate_owned_completion_v1,
             })
             .is_err()
         {
@@ -144,6 +150,16 @@ impl InitializeRequestProcessor {
             codex_home,
             platform_family: std::env::consts::FAMILY.to_string(),
             platform_os: std::env::consts::OS.to_string(),
+            capabilities: codex_app_server_protocol::ServerCapabilities {
+                terminate_owned: codex_app_server_protocol::TerminateOwnedServerCapability {
+                    completion_version: 1,
+                    notification: false,
+                    query: true,
+                    retention_seconds: crate::terminate_owned_operation_registry::TERMINATE_OWNED_TERMINAL_RETENTION_SECONDS as u64,
+                    exit_confirmation: false,
+                    drain_confirmation: false,
+                },
+            },
         };
 
         self.outgoing

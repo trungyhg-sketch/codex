@@ -41,6 +41,194 @@ fn setsid_available() -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(not(windows))]
+#[tokio::test]
+async fn native_pipe_spawn_stores_platform_gated_identity() -> anyhow::Result<()> {
+    let Some(python) = find_python() else {
+        eprintln!("python not found; skipping native identity test");
+        return Ok(());
+    };
+    let spawned = spawn_pipe_process_no_stdin(
+        &python,
+        &["-c".to_string(), "import time; time.sleep(5)".to_string()],
+        Path::new("."),
+        &std::env::vars().collect(),
+        /*arg0*/ &None,
+        &[],
+    )
+    .await?;
+    let identity = spawned
+        .session
+        .native_process_identity()
+        .ok_or_else(|| anyhow::anyhow!("missing native identity"))?;
+
+    assert!(identity.os_pid > 0);
+    assert_eq!(identity.platform, std::env::consts::OS);
+    spawned.session.request_terminate();
+    Ok(())
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn native_pipe_spawn_has_stable_unique_ownership_token() -> anyhow::Result<()> {
+    let Some(python) = find_python() else {
+        return Ok(());
+    };
+    let args = vec!["-c".to_string(), "import time; time.sleep(5)".to_string()];
+    let env = HashMap::new();
+    let arg0 = None;
+    let first = spawn_pipe_process_no_stdin(&python, &args, Path::new("."), &env, &arg0, &[]);
+    let second = spawn_pipe_process_no_stdin(&python, &args, Path::new("."), &env, &arg0, &[]);
+    let (first, second) = tokio::try_join!(first, second)?;
+    let first_token = first.session.process_ownership_token().unwrap();
+    let second_token = second.session.process_ownership_token().unwrap();
+
+    assert_eq!(
+        first_token,
+        first.session.process_ownership_token().unwrap()
+    );
+    assert_ne!(first_token, second_token);
+    assert_ne!(
+        first_token.as_str(),
+        first
+            .session
+            .native_process_identity()
+            .unwrap()
+            .os_pid
+            .to_string()
+    );
+    first.session.request_terminate();
+    second.session.request_terminate();
+    Ok(())
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn rapid_exit_and_replacement_never_reuse_ownership_token() -> anyhow::Result<()> {
+    let Some(python) = find_python() else {
+        return Ok(());
+    };
+    let args = vec!["-c".to_string(), "pass".to_string()];
+    let first =
+        spawn_pipe_process_no_stdin(&python, &args, Path::new("."), &HashMap::new(), &None, &[])
+            .await?;
+    let first_token = first
+        .session
+        .process_ownership_token()
+        .expect("native spawn must have ownership evidence")
+        .as_str()
+        .to_owned();
+    let first_identity = first.session.native_process_identity().unwrap().clone();
+    let _ = first.exit_rx.await;
+
+    let replacement =
+        spawn_pipe_process_no_stdin(&python, &args, Path::new("."), &HashMap::new(), &None, &[])
+            .await?;
+    let replacement_token = replacement
+        .session
+        .process_ownership_token()
+        .expect("replacement native spawn must have ownership evidence");
+
+    assert_ne!(first_token, replacement_token.as_str());
+    assert_ne!(
+        replacement
+            .session
+            .revalidate_native_process_identity(&first_identity),
+        crate::NativeProcessIdentityValidationResult::Match
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn native_process_live_identity_revalidation_is_fail_closed() -> anyhow::Result<()> {
+    use crate::NativeProcessIdentityValidationResult::*;
+
+    let Some(python) = find_python() else {
+        return Ok(());
+    };
+    let spawned = spawn_pipe_process_no_stdin(
+        &python,
+        &["-c".to_string(), "import time; time.sleep(5)".to_string()],
+        Path::new("."),
+        &HashMap::new(),
+        &None,
+        &[],
+    )
+    .await?;
+    let identity = spawned.session.native_process_identity().unwrap().clone();
+    assert_eq!(
+        spawned
+            .session
+            .revalidate_native_process_identity(&identity),
+        Match
+    );
+
+    let mut wrong_start = identity.clone();
+    wrong_start.creation_time = wrong_start.creation_time.map(|value| value + 1);
+    assert_eq!(
+        spawned
+            .session
+            .revalidate_native_process_identity(&wrong_start),
+        CreationTimeMismatch
+    );
+    let mut wrong_executable = identity.clone();
+    wrong_executable.executable_identity = Some("/definitely/not/the/executable".into());
+    assert_eq!(
+        spawned
+            .session
+            .revalidate_native_process_identity(&wrong_executable),
+        ExecutableMismatch
+    );
+    let mut pid_only = identity.clone();
+    pid_only.creation_time = None;
+    pid_only.executable_identity = None;
+    assert_eq!(
+        spawned
+            .session
+            .revalidate_native_process_identity(&pid_only),
+        PartialIdentity
+    );
+
+    spawned.session.request_terminate();
+    let _ = spawned.exit_rx.await;
+    assert_eq!(
+        spawned
+            .session
+            .revalidate_native_process_identity(&identity),
+        ProcessExited
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn rapid_exit_never_revalidates_old_identity() -> anyhow::Result<()> {
+    use crate::NativeProcessIdentityValidationResult::ProcessExited;
+
+    let Some(python) = find_python() else {
+        return Ok(());
+    };
+    let spawned = spawn_pipe_process_no_stdin(
+        &python,
+        &["-c".to_string(), "pass".to_string()],
+        Path::new("."),
+        &HashMap::new(),
+        &None,
+        &[],
+    )
+    .await?;
+    let identity = spawned.session.native_process_identity().unwrap().clone();
+    let _ = spawned.exit_rx.await;
+    assert_eq!(
+        spawned
+            .session
+            .revalidate_native_process_identity(&identity),
+        ProcessExited
+    );
+    Ok(())
+}
+
 fn shell_command(program: &str) -> (String, Vec<String>) {
     if cfg!(windows) {
         let cmd = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
@@ -623,6 +811,20 @@ async fn driver_backed_process_can_expose_split_stdout_and_stderr() -> anyhow::R
         .signal(ProcessSignal::Interrupt)
         .expect_err("interrupting a driver without a terminator should remain unsupported");
     assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    let fabricated = crate::NativeProcessIdentity {
+        os_pid: 1,
+        creation_time: Some(1),
+        executable_identity: Some("fabricated".into()),
+        parent_pid: Some(1),
+        parent_creation_time: Some(1),
+        platform: std::env::consts::OS,
+    };
+    assert_eq!(
+        spawned
+            .session
+            .revalidate_native_process_identity(&fabricated),
+        crate::NativeProcessIdentityValidationResult::Unsupported
+    );
 
     let SpawnedProcess {
         session: _session,

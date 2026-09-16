@@ -25,8 +25,11 @@ use codex_app_server_protocol::CollabAgentStatus;
 use codex_app_server_protocol::CollabAgentTool;
 use codex_app_server_protocol::CollabAgentToolCallStatus;
 use codex_app_server_protocol::CommandExecutionApprovalDecision;
+use codex_app_server_protocol::CommandExecutionOwnershipEvidenceNotification;
 use codex_app_server_protocol::CommandExecutionRequestApprovalResponse;
 use codex_app_server_protocol::CommandExecutionStatus;
+use codex_app_server_protocol::CommandExecutionTerminateOwnedParams;
+use codex_app_server_protocol::CommandExecutionTerminateOwnedResponse;
 use codex_app_server_protocol::FileChangeApprovalDecision;
 use codex_app_server_protocol::FileChangePatchUpdatedNotification;
 use codex_app_server_protocol::FileChangeRequestApprovalResponse;
@@ -36,11 +39,13 @@ use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::PatchApplyStatus;
 use codex_app_server_protocol::PatchChangeKind;
+use codex_app_server_protocol::ProcessOwnershipToken;
 use codex_app_server_protocol::RawResponseCompletedNotification;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ServerRequestResolvedNotification;
 use codex_app_server_protocol::SubAgentActivityKind;
+use codex_app_server_protocol::TerminateOwnedOutcome;
 use codex_app_server_protocol::TextElement;
 use codex_app_server_protocol::ThreadDeleteParams;
 use codex_app_server_protocol::ThreadDeleteResponse;
@@ -4639,6 +4644,133 @@ async fn command_execution_notifications_include_process_id() -> Result<()> {
         mcp.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "Windows native identity validation is not production-gated yet"
+)]
+async fn command_execution_ownership_evidence_routes_to_owned_termination() -> Result<()> {
+    skip_if_wine_exec!(Ok(()), "requires native process ownership evidence");
+    skip_if_no_network!(Ok(()));
+
+    let command = if cfg!(windows) {
+        "ping -n 30 127.0.0.1 >NUL"
+    } else {
+        "sleep 30"
+    };
+    let tool_call_arguments = serde_json::to_string(&json!({
+        "cmd": command,
+        "yield_time_ms": 100
+    }))?;
+    let responses = vec![
+        responses::sse(vec![
+            responses::ev_response_created("resp-owned-1"),
+            responses::ev_function_call("owned-command-1", "exec_command", &tool_call_arguments),
+            responses::ev_completed("resp-owned-1"),
+        ]),
+        create_final_assistant_message_sse_response("done")?,
+    ];
+    let server = create_mock_responses_server_sequence(responses).await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri())
+        .with_sandbox_mode("danger-full-access")
+        .enable_feature(Feature::UnifiedExec)
+        .write(codex_home.path())?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let ThreadStartResponse { thread, .. } = mcp
+        .start_thread(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let TurnStartResponse { turn } = mcp
+        .request(|request_id| ClientRequest::TurnStart {
+            request_id,
+            params: TurnStartParams {
+                thread_id: thread.id.clone(),
+                client_user_message_id: None,
+                input: vec![V2UserInput::Text {
+                    text: "run a command".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                sandbox_policy: Some(codex_app_server_protocol::SandboxPolicy::DangerFullAccess),
+                ..Default::default()
+            },
+        })
+        .await?;
+
+    let evidence: CommandExecutionOwnershipEvidenceNotification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_notification("item/commandExecution/ownershipEvidence"),
+    )
+    .await??;
+    assert_eq!(evidence.thread_id, thread.id);
+    assert_eq!(evidence.turn_id, turn.id);
+    assert_eq!(evidence.item_id, "owned-command-1");
+
+    let stale: CommandExecutionTerminateOwnedResponse = mcp
+        .request(|request_id| ClientRequest::CommandExecutionTerminateOwned {
+            request_id,
+            params: CommandExecutionTerminateOwnedParams {
+                thread_id: evidence.thread_id.clone(),
+                turn_id: evidence.turn_id.clone(),
+                item_id: "replaced-command".to_string(),
+                termination: evidence.termination.clone(),
+                operation_id: None,
+            },
+        })
+        .await?;
+    assert_eq!(stale.outcome, TerminateOwnedOutcome::StaleEvidence);
+
+    let mut wrong_termination = evidence.termination.clone();
+    wrong_termination.ownership_token =
+        ProcessOwnershipToken::from_opaque("wrong-token-marker".to_string());
+    let rejected: CommandExecutionTerminateOwnedResponse = mcp
+        .request(|request_id| ClientRequest::CommandExecutionTerminateOwned {
+            request_id,
+            params: CommandExecutionTerminateOwnedParams {
+                thread_id: evidence.thread_id.clone(),
+                turn_id: evidence.turn_id.clone(),
+                item_id: evidence.item_id.clone(),
+                termination: wrong_termination,
+                operation_id: None,
+            },
+        })
+        .await?;
+    assert_eq!(rejected.outcome, TerminateOwnedOutcome::OwnershipMismatch);
+
+    let response: CommandExecutionTerminateOwnedResponse = mcp
+        .request(|request_id| ClientRequest::CommandExecutionTerminateOwned {
+            request_id,
+            params: CommandExecutionTerminateOwnedParams {
+                thread_id: evidence.thread_id,
+                turn_id: evidence.turn_id,
+                item_id: evidence.item_id,
+                termination: evidence.termination,
+                operation_id: None,
+            },
+        })
+        .await?;
+    assert!(matches!(
+        response.outcome,
+        TerminateOwnedOutcome::Terminated | TerminateOwnedOutcome::AlreadyExited
+    ));
+
+    let completed: TurnCompletedNotification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_notification("turn/completed"),
+    )
+    .await??;
+    assert_eq!(completed.thread_id, thread.id);
+    assert_eq!(completed.turn.id, turn.id);
 
     Ok(())
 }

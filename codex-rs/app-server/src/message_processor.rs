@@ -178,6 +178,7 @@ pub(crate) struct InitializedConnectionSessionState {
     pub(crate) client_version: String,
     pub(crate) request_attestation: bool,
     pub(crate) client_mcp_extensions: ClientMcpExtensions,
+    pub(crate) terminate_owned_completion_v1: bool,
 }
 
 impl Default for ConnectionSessionState {
@@ -235,6 +236,11 @@ impl ConnectionSessionState {
             .get()
             .map(|session| session.client_mcp_extensions.clone())
             .unwrap_or_default()
+    }
+    pub(crate) fn terminate_owned_completion_v1(&self) -> bool {
+        self.initialized
+            .get()
+            .is_some_and(|session| session.terminate_owned_completion_v1)
     }
     pub(crate) fn initialize(&self, session: InitializedConnectionSessionState) -> Result<(), ()> {
         self.initialized.set(session).map_err(|_| ())
@@ -1276,6 +1282,22 @@ impl MessageProcessor {
             ClientRequest::ThreadBackgroundTerminalsTerminate { params, .. } => {
                 self.thread_processor
                     .thread_background_terminals_terminate(params)
+                    .await
+            }
+            ClientRequest::CommandExecutionTerminateOwned { params, .. } => {
+                self.thread_processor
+                    .command_execution_terminate_owned(
+                        params,
+                        session.terminate_owned_completion_v1(),
+                    )
+                    .await
+            }
+            ClientRequest::CommandExecutionTerminateOwnedStatus { params, .. } => {
+                self.thread_processor
+                    .command_execution_terminate_owned_status(
+                        params,
+                        session.terminate_owned_completion_v1(),
+                    )
                     .await
             }
             ClientRequest::ThreadRollback { params, .. } => {

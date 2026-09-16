@@ -78,13 +78,12 @@ async fn exec_server_starts_process_over_websocket() -> anyhow::Result<()> {
     };
     assert_eq!(id, process_start_id);
     let process_start_response: ExecResponse = serde_json::from_value(result)?;
+    assert_eq!(process_start_response.process_id, ProcessId::from("proc-1"));
     assert_eq!(
-        process_start_response,
-        ExecResponse {
-            process_id: ProcessId::from("proc-1"),
-            sandbox_type: Some(ProcessSandboxType::None),
-        }
+        process_start_response.sandbox_type,
+        Some(ProcessSandboxType::None)
     );
+    assert!(process_start_response.native_process_ownership.is_some());
 
     server.shutdown().await?;
     Ok(())
@@ -224,13 +223,10 @@ async fn exec_server_runs_ordinary_requests_serially_by_default() -> anyhow::Res
         panic!("expected the queued process/start response after process/read");
     };
     assert_eq!(id, queued_start_id);
-    assert_eq!(
-        serde_json::from_value::<ExecResponse>(result)?,
-        ExecResponse {
-            process_id: ProcessId::from("proc-serial-queued"),
-            sandbox_type: Some(ProcessSandboxType::None),
-        }
-    );
+    let started: ExecResponse = serde_json::from_value(result)?;
+    assert_eq!(started.process_id, ProcessId::from("proc-serial-queued"));
+    assert_eq!(started.sandbox_type, Some(ProcessSandboxType::None));
+    assert!(started.native_process_ownership.is_some());
 
     for process_id in ["proc-serial-read", "proc-serial-queued"] {
         let terminate_id = server
@@ -340,13 +336,10 @@ async fn exec_server_keeps_control_requests_live_during_long_reads_and_queued_re
         panic!("expected process/start to finish before the pending process/read");
     };
     assert_eq!(id, concurrent_start_id);
-    assert_eq!(
-        serde_json::from_value::<ExecResponse>(result)?,
-        ExecResponse {
-            process_id: ProcessId::from("proc-concurrent"),
-            sandbox_type: Some(ProcessSandboxType::None),
-        }
-    );
+    let started: ExecResponse = serde_json::from_value(result)?;
+    assert_eq!(started.process_id, ProcessId::from("proc-concurrent"));
+    assert_eq!(started.sandbox_type, Some(ProcessSandboxType::None));
+    assert!(started.native_process_ownership.is_some());
     for _ in 1..32 {
         server
             .send_request("process/read", read_params.clone())
@@ -498,12 +491,14 @@ async fn exec_server_defaults_omitted_pipe_stdin_to_closed_stdin() -> anyhow::Re
     };
     let process_start_response: ExecResponse = serde_json::from_value(result)?;
     assert_eq!(
-        process_start_response,
-        ExecResponse {
-            process_id: ProcessId::from("proc-default-stdin"),
-            sandbox_type: Some(ProcessSandboxType::None),
-        }
+        process_start_response.process_id,
+        ProcessId::from("proc-default-stdin")
     );
+    assert_eq!(
+        process_start_response.sandbox_type,
+        Some(ProcessSandboxType::None)
+    );
+    assert!(process_start_response.native_process_ownership.is_some());
 
     let write_id = server
         .send_request(

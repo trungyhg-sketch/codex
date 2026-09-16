@@ -59,12 +59,18 @@ async fn initialize_uses_client_info_name_as_originator() -> Result<()> {
         codex_home: response_codex_home,
         platform_family,
         platform_os,
+        capabilities,
     } = to_response::<InitializeResponse>(response)?;
 
     assert!(user_agent.starts_with("codex_vscode/"));
     assert_eq!(response_codex_home, expected_codex_home);
     assert_eq!(platform_family, std::env::consts::FAMILY);
     assert_eq!(platform_os, std::env::consts::OS);
+    assert_eq!(capabilities.terminate_owned.completion_version, 1);
+    assert!(capabilities.terminate_owned.query);
+    assert!(!capabilities.terminate_owned.notification);
+    assert!(!capabilities.terminate_owned.exit_confirmation);
+    assert!(!capabilities.terminate_owned.drain_confirmation);
     Ok(())
 }
 
@@ -171,6 +177,7 @@ async fn initialize_respects_originator_override_env_var() -> Result<()> {
         codex_home: response_codex_home,
         platform_family,
         platform_os,
+        capabilities: _,
     } = to_response::<InitializeResponse>(response)?;
 
     assert!(user_agent.starts_with("codex_originator_via_env_var/"));

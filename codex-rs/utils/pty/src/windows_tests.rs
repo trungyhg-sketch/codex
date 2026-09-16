@@ -22,6 +22,156 @@ use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
 const READY_MARKER: &str = "__CODEX_CHILD_READY__";
 const VALUE_MARKER: &str = "__CODEX_CHILD_VALUE__";
 
+#[tokio::test]
+async fn native_spawn_captures_distinct_process_identities() -> anyhow::Result<()> {
+    let Some(python) = find_python() else {
+        eprintln!("python not found; skipping Windows native identity test");
+        return Ok(());
+    };
+    let args = vec!["-c".to_string(), "import time; time.sleep(5)".to_string()];
+    let env: HashMap<String, String> = std::env::vars().collect();
+    let first = spawn_pipe_process_no_stdin(
+        &python,
+        &args,
+        Path::new("."),
+        &env,
+        /*arg0*/ &None,
+        &[],
+    )
+    .await?;
+    let second = spawn_pipe_process_no_stdin(
+        &python,
+        &args,
+        Path::new("."),
+        &env,
+        /*arg0*/ &None,
+        &[],
+    )
+    .await?;
+
+    let first_identity = first.session.native_process_identity().cloned();
+    let second_identity = second.session.native_process_identity().cloned();
+    let first_identity = first_identity.ok_or_else(|| anyhow::anyhow!("missing first identity"))?;
+    let second_identity =
+        second_identity.ok_or_else(|| anyhow::anyhow!("missing second identity"))?;
+
+    assert_ne!(first_identity.os_pid, second_identity.os_pid);
+    assert!(first_identity.creation_time.is_some_and(|value| value > 0));
+    assert!(second_identity.creation_time.is_some_and(|value| value > 0));
+    let executable = first_identity
+        .executable_identity
+        .as_ref()
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("missing executable identity"))?;
+    let expected_executable = Path::new(&python)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("invalid Python executable"))?;
+    let executable_stem = Path::new(executable)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("invalid executable identity"))?;
+    assert_eq!(
+        executable_stem.to_ascii_lowercase(),
+        expected_executable.to_ascii_lowercase()
+    );
+    assert_eq!(first_identity.parent_pid, Some(std::process::id()));
+    assert!(
+        first_identity
+            .parent_creation_time
+            .is_some_and(|value| value > 0)
+    );
+
+    first.session.request_terminate();
+    second.session.request_terminate();
+    Ok(())
+}
+
+#[tokio::test]
+async fn owned_handle_revalidates_windows_native_identity() -> anyhow::Result<()> {
+    use crate::NativeProcessIdentityValidationResult::*;
+
+    let Some(python) = find_python() else {
+        return Ok(());
+    };
+    let spawned = spawn_pipe_process_no_stdin(
+        &python,
+        &["-c".to_string(), "import time; time.sleep(5)".to_string()],
+        Path::new("."),
+        &HashMap::new(),
+        &None,
+        &[],
+    )
+    .await?;
+    let identity = spawned.session.native_process_identity().unwrap().clone();
+    assert_eq!(
+        spawned
+            .session
+            .revalidate_native_process_identity(&identity),
+        Match
+    );
+
+    let mut wrong_creation = identity.clone();
+    wrong_creation.creation_time = wrong_creation.creation_time.map(|value| value + 1);
+    assert_eq!(
+        spawned
+            .session
+            .revalidate_native_process_identity(&wrong_creation),
+        CreationTimeMismatch
+    );
+    let mut wrong_executable = identity.clone();
+    wrong_executable.executable_identity = Some("C:\\not-the-owned-process.exe".into());
+    assert_eq!(
+        spawned
+            .session
+            .revalidate_native_process_identity(&wrong_executable),
+        ExecutableMismatch
+    );
+    let mut wrong_parent = identity.clone();
+    wrong_parent.parent_creation_time = wrong_parent.parent_creation_time.map(|value| value + 1);
+    assert_eq!(
+        spawned
+            .session
+            .revalidate_native_process_identity(&wrong_parent),
+        ParentIdentityMismatch
+    );
+
+    spawned.session.request_terminate();
+    let _ = spawned.exit_rx.await;
+    assert_eq!(
+        spawned
+            .session
+            .revalidate_native_process_identity(&identity),
+        ProcessExited
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn rapid_exit_preserves_the_spawn_identity_snapshot() -> anyhow::Result<()> {
+    let Some(python) = find_python() else {
+        eprintln!("python not found; skipping Windows rapid-exit identity test");
+        return Ok(());
+    };
+    let env: HashMap<String, String> = std::env::vars().collect();
+    let spawned = spawn_pipe_process_no_stdin(
+        &python,
+        &["-c".to_string(), "pass".to_string()],
+        Path::new("."),
+        &env,
+        /*arg0*/ &None,
+        &[],
+    )
+    .await?;
+    let identity = spawned.session.native_process_identity().cloned();
+    let (_session, output_rx, exit_rx) = combine_spawned_output(spawned);
+    let _ = collect_output_until_exit(output_rx, exit_rx, /*timeout_ms*/ 10_000).await;
+
+    assert!(identity.is_some_and(|value| value.creation_time.is_some()));
+    Ok(())
+}
+
 struct WindowsShell {
     name: &'static str,
     program: String,

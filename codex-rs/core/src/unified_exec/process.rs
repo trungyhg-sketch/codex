@@ -89,10 +89,12 @@ enum ProcessHandle {
 /// processes.
 pub(crate) struct UnifiedExecProcess {
     process_handle: ProcessHandle,
+    native_process_ownership: Option<codex_exec_server::NativeProcessOwnership>,
     output_tx: broadcast::Sender<Vec<u8>>,
     output: OutputHandles,
     output_drained: Arc<Notify>,
     interaction_lock: Arc<Mutex<()>>,
+    owned_termination_handled: AtomicBool,
     state_tx: watch::Sender<ProcessState>,
     state_rx: watch::Receiver<ProcessState>,
     output_task: Option<JoinHandle<()>>,
@@ -113,6 +115,7 @@ impl std::fmt::Debug for UnifiedExecProcess {
 impl UnifiedExecProcess {
     fn new(
         process_handle: ProcessHandle,
+        native_process_ownership: Option<codex_exec_server::NativeProcessOwnership>,
         sandbox_type: SandboxType,
         spawn_lifecycle: Option<SpawnLifecycleHandle>,
     ) -> Self {
@@ -129,10 +132,12 @@ impl UnifiedExecProcess {
 
         Self {
             process_handle,
+            native_process_ownership,
             output_tx,
             output,
             output_drained,
             interaction_lock: Arc::new(Mutex::new(())),
+            owned_termination_handled: AtomicBool::new(false),
             state_tx,
             state_rx,
             output_task: None,
@@ -239,6 +244,81 @@ impl UnifiedExecProcess {
         Ok(())
     }
 
+    /// Terminates only after validating the ownership evidence against the
+    /// already-owned process handle. The manager serializes this call with all
+    /// other interactions for the same process.
+    pub(super) async fn terminate_owned(
+        &self,
+        params: codex_exec_server_protocol::TerminateOwnedParams,
+    ) -> codex_exec_server_protocol::TerminateOwnedOutcome {
+        use codex_exec_server_protocol::TerminateOwnedOutcome::*;
+
+        let outcome = match &self.process_handle {
+            ProcessHandle::Local(process_handle) => {
+                let Some(ownership) = &self.native_process_ownership else {
+                    return Unsupported;
+                };
+                if ownership.ownership_token != params.ownership_token {
+                    return OwnershipMismatch;
+                }
+                if ownership.identity.as_ref() != Some(&params.expected_identity) {
+                    return StaleEvidence;
+                }
+                let Some(platform) = protocol_identity_platform(&params.expected_identity.platform)
+                else {
+                    return Unsupported;
+                };
+                let expected = codex_utils_pty::NativeProcessIdentity {
+                    os_pid: params.expected_identity.os_pid,
+                    creation_time: params.expected_identity.creation_time,
+                    executable_identity: params
+                        .expected_identity
+                        .executable_identity
+                        .as_ref()
+                        .map(std::path::PathBuf::from),
+                    parent_pid: params.expected_identity.parent_pid,
+                    parent_creation_time: params.expected_identity.parent_creation_time,
+                    platform,
+                };
+                match process_handle.revalidate_native_process_identity(&expected) {
+                    codex_utils_pty::NativeProcessIdentityValidationResult::Match => {
+                        process_handle.terminate();
+                        self.signal_exit(self.exit_code());
+                        self.finish_termination();
+                        Terminated
+                    }
+                    codex_utils_pty::NativeProcessIdentityValidationResult::ProcessExited => {
+                        AlreadyExited
+                    }
+                    codex_utils_pty::NativeProcessIdentityValidationResult::PidMismatch
+                    | codex_utils_pty::NativeProcessIdentityValidationResult::CreationTimeMismatch
+                    | codex_utils_pty::NativeProcessIdentityValidationResult::ExecutableMismatch
+                    | codex_utils_pty::NativeProcessIdentityValidationResult::ParentIdentityMismatch => {
+                        IdentityMismatch
+                    }
+                    codex_utils_pty::NativeProcessIdentityValidationResult::IdentityUnavailable => {
+                        IdentityUnavailable
+                    }
+                    codex_utils_pty::NativeProcessIdentityValidationResult::PartialIdentity => {
+                        PartialIdentity
+                    }
+                    codex_utils_pty::NativeProcessIdentityValidationResult::Unsupported => Unsupported,
+                    codex_utils_pty::NativeProcessIdentityValidationResult::InternalError => InternalError,
+                }
+            }
+            ProcessHandle::ExecServer(process_handle) => process_handle
+                .terminate_owned(params)
+                .await
+                .map(|response| response.outcome)
+                .unwrap_or(InternalError),
+        };
+        if matches!(outcome, Terminated | AlreadyExited) {
+            self.owned_termination_handled
+                .store(true, Ordering::Release);
+        }
+        outcome
+    }
+
     pub(super) async fn interrupt(&self) -> Result<(), UnifiedExecError> {
         match &self.process_handle {
             ProcessHandle::Local(process_handle) => process_handle
@@ -266,6 +346,12 @@ impl UnifiedExecProcess {
 
     pub(crate) fn sandbox_type(&self) -> SandboxType {
         self.sandbox_type
+    }
+
+    pub(super) fn native_process_ownership(
+        &self,
+    ) -> Option<&codex_exec_server::NativeProcessOwnership> {
+        self.native_process_ownership.as_ref()
     }
 
     pub(super) fn failure_message(&self) -> Option<String> {
@@ -334,9 +420,30 @@ impl UnifiedExecProcess {
             stderr_rx,
             mut exit_rx,
         } = spawned;
+        let native_process_ownership = process_handle.process_ownership_token().map(|token| {
+            codex_exec_server::NativeProcessOwnership {
+                ownership_token: codex_exec_server::ProcessOwnershipToken::from_opaque(
+                    token.as_str().to_owned(),
+                ),
+                identity: process_handle.native_process_identity().map(|identity| {
+                    codex_exec_server::NativeProcessIdentity {
+                        os_pid: identity.os_pid,
+                        creation_time: identity.creation_time,
+                        executable_identity: identity
+                            .executable_identity
+                            .as_ref()
+                            .map(|path| path.to_string_lossy().into_owned()),
+                        parent_pid: identity.parent_pid,
+                        parent_creation_time: identity.parent_creation_time,
+                        platform: identity.platform.to_string(),
+                    }
+                }),
+            }
+        });
         let output_rx = codex_utils_pty::combine_output_receivers(stdout_rx, stderr_rx);
         let mut managed = Self::new(
             ProcessHandle::Local(Box::new(process_handle)),
+            native_process_ownership,
             sandbox_type,
             Some(spawn_lifecycle),
         );
@@ -383,11 +490,17 @@ impl UnifiedExecProcess {
     pub(super) async fn from_exec_server_started(
         started: StartedExecProcess,
     ) -> Result<Self, UnifiedExecError> {
+        let native_process_ownership = started.native_process_ownership.clone();
         let process_handle = ProcessHandle::ExecServer(Arc::clone(&started.process));
         // Older peers do not report this field. In that case, skip local
         // classification rather than attributing a violation to a guessed backend.
         let sandbox_type = started.sandbox_type.unwrap_or(SandboxType::None);
-        let mut managed = Self::new(process_handle, sandbox_type, /*spawn_lifecycle*/ None);
+        let mut managed = Self::new(
+            process_handle,
+            native_process_ownership,
+            sandbox_type,
+            /*spawn_lifecycle*/ None,
+        );
         let output_handles = managed.output_handles().clone();
         managed.output_task = Some(Self::spawn_exec_server_output_task(
             started,
@@ -628,8 +741,19 @@ impl UnifiedExecProcess {
     }
 }
 
+fn protocol_identity_platform(platform: &str) -> Option<&'static str> {
+    match platform {
+        "linux" => Some("linux"),
+        "windows" => Some("windows"),
+        "macos" => Some("macos"),
+        _ => None,
+    }
+}
+
 impl Drop for UnifiedExecProcess {
     fn drop(&mut self) {
-        self.terminate();
+        if !self.owned_termination_handled.load(Ordering::Acquire) {
+            self.terminate();
+        }
     }
 }

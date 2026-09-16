@@ -16,6 +16,8 @@ use crate::process::sandbox_type_from_protocol;
 use crate::protocol::ExecParams;
 use crate::protocol::ProcessSignal;
 use crate::protocol::ReadResponse;
+use crate::protocol::TerminateOwnedParams;
+use crate::protocol::TerminateOwnedResponse;
 use crate::protocol::WriteResponse;
 
 #[derive(Clone)]
@@ -41,10 +43,12 @@ impl RemoteProcess {
         let client = self.client.get().await?;
         let session = client.start_process(params, network_policy_decider).await?;
         let sandbox_type = sandbox_type_from_protocol(session.sandbox_type());
+        let native_process_ownership = session.native_process_ownership().cloned();
 
         Ok(StartedExecProcess {
             process: Arc::new(RemoteExecProcess { session }),
             sandbox_type,
+            native_process_ownership,
         })
     }
 }
@@ -89,6 +93,13 @@ impl RemoteExecProcess {
         trace!("exec process terminate");
         self.session.terminate().await
     }
+
+    async fn terminate_owned(
+        &self,
+        params: TerminateOwnedParams,
+    ) -> Result<TerminateOwnedResponse, crate::ExecServerError> {
+        self.session.terminate_owned(&params).await
+    }
 }
 
 impl ExecProcess for RemoteExecProcess {
@@ -123,6 +134,13 @@ impl ExecProcess for RemoteExecProcess {
 
     fn terminate(&self) -> ExecProcessFuture<'_, ()> {
         Box::pin(RemoteExecProcess::terminate(self))
+    }
+
+    fn terminate_owned(
+        &self,
+        params: TerminateOwnedParams,
+    ) -> ExecProcessFuture<'_, TerminateOwnedResponse> {
+        Box::pin(RemoteExecProcess::terminate_owned(self, params))
     }
 }
 

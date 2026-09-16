@@ -8,6 +8,8 @@ use crate::protocol::ReadParams;
 use crate::protocol::ReadResponse;
 use crate::protocol::SignalParams;
 use crate::protocol::SignalResponse;
+use crate::protocol::TerminateOwnedParams;
+use crate::protocol::TerminateOwnedResponse;
 use crate::protocol::TerminateParams;
 use crate::protocol::TerminateResponse;
 use crate::protocol::WriteParams;
@@ -69,5 +71,12 @@ impl ProcessHandler {
         params: TerminateParams,
     ) -> Result<TerminateResponse, JSONRPCErrorError> {
         self.process.terminate_process(params).await
+    }
+
+    pub(crate) async fn terminate_owned(
+        &self,
+        params: TerminateOwnedParams,
+    ) -> Result<TerminateOwnedResponse, JSONRPCErrorError> {
+        self.process.terminate_owned_process(params).await
     }
 }

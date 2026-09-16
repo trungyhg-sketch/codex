@@ -189,6 +189,20 @@ async fn spawn_process_with_stdin_mode(
     #[cfg(windows)]
     let job = crate::win::JobObject::create().map(Arc::new);
     let mut child = command.spawn()?;
+    let os_pid = child
+        .id()
+        .ok_or_else(|| io::Error::other("missing child pid"))?;
+    #[cfg(windows)]
+    let native_process_identity = child.raw_handle().map(|handle| {
+        crate::native_process_identity::capture_native_process_identity(os_pid, handle)
+    });
+    #[cfg(windows)]
+    let native_process_handle = child
+        .raw_handle()
+        .and_then(|handle| crate::native_process_identity::duplicate_process_handle(handle).ok());
+    #[cfg(not(windows))]
+    let native_process_identity =
+        Some(crate::native_process_identity::capture_native_process_identity(os_pid));
     #[cfg(windows)]
     let windows_terminator = {
         // Accept the small race: a descendant created between spawn and
@@ -299,6 +313,10 @@ async fn spawn_process_with_stdin_mode(
     });
 
     let handle = ProcessHandle::new(
+        native_process_identity,
+        #[cfg(windows)]
+        native_process_handle,
+        Some(crate::ProcessOwnershipToken::new()),
         writer_tx,
         Box::new(PipeChildTerminator {
             #[cfg(windows)]
