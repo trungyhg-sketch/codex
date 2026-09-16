@@ -202,8 +202,16 @@ enum OwnershipTerminationState {
 #[derive(Clone)]
 struct ProcessOwnershipEvidence {
     native_process_ownership: Option<codex_exec_server::NativeProcessOwnership>,
+    #[expect(
+        dead_code,
+        reason = "retained as ownership evidence for later termination validation"
+    )]
     command_signature: Option<SafeCommandSignature>,
     identity_state: NativeIdentityState,
+    #[expect(
+        dead_code,
+        reason = "retained as ownership evidence for later termination validation"
+    )]
     spawned_at: tokio::time::Instant,
 }
 
