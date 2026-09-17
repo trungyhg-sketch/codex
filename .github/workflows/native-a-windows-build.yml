@@ -34,6 +34,11 @@ jobs:
       - name: Clippy strict
         run: cargo clippy -p codex-app-server -p codex-app-server-protocol -p codex-utils-pty --all-targets -- -D warnings
 
+      - name: Regenerate protocol schema fixtures
+        run: |
+          python .\app-server-protocol\scripts\write_schema_fixtures.py
+          python .\app-server-protocol\scripts\write_schema_fixtures.py --experimental
+
       - name: App Server protocol tests
         run: cargo test -p codex-app-server-protocol
 
@@ -60,3 +65,4 @@ jobs:
             codex-rs/target/release/codex.exe
             codex-rs/target/release/codex.exe.sha256.txt
           if-no-files-found: error
+
